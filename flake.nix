@@ -7,10 +7,13 @@
   };
 
   outputs = {
+    self,
     nixpkgs,
     flake-utils,
     ...
   }:
+    # Per-system outputs (packages, apps, devShells). nixosModules is
+    # system-independent and is merged in below.
     flake-utils.lib.eachDefaultSystem (
       system: let
         pkgs = nixpkgs.legacyPackages.${system};
@@ -58,5 +61,23 @@
           };
         };
       }
-    );
+    )
+    // {
+      # NixOS module. Operators add `imports = [ tack.nixosModules.default ];`
+      # and configure via `services.tangled.tack`. Mirrors the upstream
+      # Tangled module shape (services.tangled.spindle, .knot, …) so the
+      # config namespace is consistent.
+      nixosModules.default = {
+        lib,
+        pkgs,
+        ...
+      }: {
+        imports = [./nix/modules/tack.nix];
+
+        services.tangled.tack.package =
+          lib.mkDefault
+          self.packages.${pkgs.stdenv.hostPlatform.system}.tack;
+      };
+      nixosModules.tack = self.nixosModules.default;
+    };
 }
