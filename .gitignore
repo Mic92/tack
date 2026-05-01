@@ -1,0 +1,13 @@
+/tack
+.direnv/
+result
+*.test
+*.out
+.DS_Store
+.env
+.env.*
+!.env.example
+*.db
+*.db-journal
+*.db-shm
+*.db-wal
