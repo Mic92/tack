@@ -7,6 +7,7 @@ require (
 	github.com/charmbracelet/log v1.0.0
 	github.com/gorilla/websocket v1.5.4-0.20250319132907-e064f32e3674
 	github.com/mattn/go-sqlite3 v1.14.44
+	go.yaml.in/yaml/v2 v2.4.3
 	tangled.org/core v1.13.0-alpha
 )
 
@@ -50,7 +51,6 @@ require (
 	github.com/whyrusleeping/cbor-gen v0.3.1 // indirect
 	github.com/xo/terminfo v0.0.0-20220910002029-abceb7e1c41e // indirect
 	go.uber.org/atomic v1.11.0 // indirect
-	go.yaml.in/yaml/v2 v2.4.3 // indirect
 	golang.org/x/crypto v0.48.0 // indirect
 	golang.org/x/exp v0.0.0-20260112195511-716be5621a96 // indirect
 	golang.org/x/net v0.50.0 // indirect

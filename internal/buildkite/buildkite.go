@@ -39,24 +39,24 @@ var APIBase = "https://api.buildkite.com"
 // maps it onto its own ErrLogsNotFound for the /logs handler).
 var ErrNotFound = errors.New("buildkite: not found")
 
-// Client is a thin wrapper around net/http carrying API credentials
-// + organization context so call sites don't repeat them. Safe for
-// concurrent use; the embedded http.Client is goroutine-safe.
+// Client is a thin wrapper around net/http carrying API credentials.
+// Organisation slug is *not* held on the client — every call takes
+// its target org explicitly so a single client can address multiple
+// orgs the token has access to. Safe for concurrent use; the
+// embedded http.Client is goroutine-safe.
 type Client struct {
 	http  *http.Client
 	token string
-	org   string
 }
 
 // NewClient builds a Client with sensible defaults. The 30s timeout
 // covers individual requests, not the whole client lifetime —
 // long-poll-style endpoints aren't used here, so a generous-but-bounded
 // per-request timeout is the right default.
-func NewClient(token, org string) *Client {
+func NewClient(token string) *Client {
 	return &Client{
 		http:  &http.Client{Timeout: 30 * time.Second},
 		token: token,
-		org:   org,
 	}
 }
 
@@ -95,16 +95,22 @@ type Build struct {
 // fields callers actively use are exposed — the upstream API accepts
 // many more, but we'd just be passing through dead options.
 //
-// IgnorePipelineBranchFilters defaults to false on the wire (omitempty
-// elides the zero value); callers that want pipeline-level branch
-// filters bypassed should set it to true.
+// IgnorePipelineBranchFilters / CleanCheckout default to false on the
+// wire (omitempty elides the zero value); callers that want them
+// turned on should set the field explicitly.
+//
+// PullRequestBaseBranch surfaces a Tangled PR trigger's target
+// branch so Buildkite step filters keyed on the PR base behave the
+// way users expect.
 type CreateBuildRequest struct {
 	Commit                      string            `json:"commit"`
 	Branch                      string            `json:"branch"`
 	Message                     string            `json:"message,omitempty"`
 	Env                         map[string]string `json:"env,omitempty"`
 	MetaData                    map[string]string `json:"meta_data,omitempty"`
+	CleanCheckout               bool              `json:"clean_checkout,omitempty"`
 	IgnorePipelineBranchFilters bool              `json:"ignore_pipeline_branch_filters,omitempty"`
+	PullRequestBaseBranch       string            `json:"pull_request_base_branch,omitempty"`
 }
 
 // CreateBuild fires a build on the named pipeline. Returns the
@@ -117,6 +123,7 @@ type CreateBuildRequest struct {
 // the caller's log.
 func (c *Client) CreateBuild(
 	ctx context.Context,
+	org string,
 	pipelineSlug string,
 	req CreateBuildRequest,
 ) (*Build, error) {
@@ -126,7 +133,7 @@ func (c *Client) CreateBuild(
 	}
 
 	url := fmt.Sprintf("%s/v2/organizations/%s/pipelines/%s/builds",
-		APIBase, c.org, pipelineSlug,
+		APIBase, org, pipelineSlug,
 	)
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
 	if err != nil {
@@ -162,11 +169,12 @@ func (c *Client) CreateBuild(
 // Returns ErrNotFound when Buildkite responds 404.
 func (c *Client) GetBuild(
 	ctx context.Context,
+	org string,
 	pipelineSlug string,
 	buildNumber int64,
 ) (*Build, error) {
 	url := fmt.Sprintf("%s/v2/organizations/%s/pipelines/%s/builds/%d",
-		APIBase, c.org, pipelineSlug, buildNumber,
+		APIBase, org, pipelineSlug, buildNumber,
 	)
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
@@ -205,12 +213,13 @@ func (c *Client) GetBuild(
 // job that hasn't started yet — it has no log to serve).
 func (c *Client) GetJobLog(
 	ctx context.Context,
+	org string,
 	pipelineSlug string,
 	buildNumber int64,
 	jobID string,
 ) (string, error) {
 	url := fmt.Sprintf("%s/v2/organizations/%s/pipelines/%s/builds/%d/jobs/%s/log",
-		APIBase, c.org, pipelineSlug, buildNumber, jobID,
+		APIBase, org, pipelineSlug, buildNumber, jobID,
 	)
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {

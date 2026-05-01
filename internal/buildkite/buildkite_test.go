@@ -121,8 +121,8 @@ func TestClientCreateBuild(t *testing.T) {
 	APIBase = srv.URL
 	defer func() { APIBase = prev }()
 
-	c := NewClient("tok", "myorg")
-	build, err := c.CreateBuild(context.Background(), "mypipe", CreateBuildRequest{
+	c := NewClient("tok")
+	build, err := c.CreateBuild(context.Background(), "myorg", "mypipe", CreateBuildRequest{
 		Commit:   "abc",
 		Branch:   "main",
 		MetaData: map[string]string{"k": "v"},
@@ -150,8 +150,8 @@ func TestClientCreateBuildError(t *testing.T) {
 	APIBase = srv.URL
 	defer func() { APIBase = prev }()
 
-	c := NewClient("tok", "myorg")
-	_, err := c.CreateBuild(context.Background(), "mypipe", CreateBuildRequest{})
+	c := NewClient("tok")
+	_, err := c.CreateBuild(context.Background(), "myorg", "mypipe", CreateBuildRequest{})
 	if err == nil {
 		t.Fatal("expected error")
 	}
@@ -180,8 +180,8 @@ func TestClientGetJobLog(t *testing.T) {
 		APIBase = srv.URL
 		defer func() { APIBase = prev }()
 
-		body, err := NewClient("tok", "myorg").
-			GetJobLog(context.Background(), "mypipe", 7, "job-1")
+		body, err := NewClient("tok").
+			GetJobLog(context.Background(), "myorg", "mypipe", 7, "job-1")
 		if err != nil {
 			t.Fatalf("GetJobLog: %v", err)
 		}
@@ -198,8 +198,8 @@ func TestClientGetJobLog(t *testing.T) {
 		APIBase = srv.URL
 		defer func() { APIBase = prev }()
 
-		_, err := NewClient("tok", "myorg").
-			GetJobLog(context.Background(), "mypipe", 7, "job-1")
+		_, err := NewClient("tok").
+			GetJobLog(context.Background(), "myorg", "mypipe", 7, "job-1")
 		if err != ErrNotFound {
 			t.Fatalf("err = %v; want ErrNotFound", err)
 		}

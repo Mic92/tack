@@ -37,9 +37,13 @@ type config struct {
 	// (useful for local development against a real Tangled
 	// jetstream); when set, the other Buildkite fields are
 	// required and tack will refuse to start without them.
+	//
+	// BuildkiteOrg is the *default* org used when a workflow YAML
+	// doesn't specify one of its own. The pipeline a workflow runs
+	// against is no longer global — it's pulled from the workflow
+	// body itself (see workflowConfig in provider_buildkite.go).
 	BuildkiteToken         string
 	BuildkiteOrg           string
-	BuildkitePipeline      string
 	BuildkiteWebhookSecret string
 	BuildkiteWebhookMode   buildkite.WebhookMode
 }
@@ -54,7 +58,6 @@ func loadConfig() (config, error) {
 		Dev:                    os.Getenv("TACK_DEV") != "",
 		BuildkiteToken:         os.Getenv("TACK_BUILDKITE_TOKEN"),
 		BuildkiteOrg:           os.Getenv("TACK_BUILDKITE_ORG"),
-		BuildkitePipeline:      os.Getenv("TACK_BUILDKITE_PIPELINE"),
 		BuildkiteWebhookSecret: os.Getenv("TACK_BUILDKITE_WEBHOOK_SECRET"),
 		BuildkiteWebhookMode: buildkite.WebhookMode(
 			envOr("TACK_BUILDKITE_WEBHOOK_MODE", string(buildkite.WebhookModeToken)),
@@ -84,9 +87,6 @@ func loadConfig() (config, error) {
 	if cfg.BuildkiteToken != "" {
 		if cfg.BuildkiteOrg == "" {
 			return cfg, errors.New("TACK_BUILDKITE_ORG is required when TACK_BUILDKITE_TOKEN is set")
-		}
-		if cfg.BuildkitePipeline == "" {
-			return cfg, errors.New("TACK_BUILDKITE_PIPELINE is required when TACK_BUILDKITE_TOKEN is set")
 		}
 		if cfg.BuildkiteWebhookSecret == "" {
 			return cfg, errors.New("TACK_BUILDKITE_WEBHOOK_SECRET is required when TACK_BUILDKITE_TOKEN is set")
@@ -176,16 +176,15 @@ func main() {
 	if cfg.BuildkiteToken != "" {
 		bkProvider = newBuildkiteProvider(
 			br, st,
-			buildkite.NewClient(cfg.BuildkiteToken, cfg.BuildkiteOrg),
-			cfg.BuildkitePipeline,
+			buildkite.NewClient(cfg.BuildkiteToken),
+			cfg.BuildkiteOrg,
 			cfg.BuildkiteWebhookSecret,
 			cfg.BuildkiteWebhookMode,
 			logger,
 		)
 		provider = bkProvider
 		logger.Info("buildkite provider enabled",
-			"org", cfg.BuildkiteOrg,
-			"pipeline", cfg.BuildkitePipeline,
+			"default_org", cfg.BuildkiteOrg,
 			"webhook_mode", cfg.BuildkiteWebhookMode,
 		)
 	} else {

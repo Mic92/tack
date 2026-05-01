@@ -47,8 +47,8 @@ func newBuildkiteTestProvider(
 	logger := slog.Default()
 	p := newBuildkiteProvider(
 		br, st,
-		buildkite.NewClient("tok", "myorg"),
-		"mypipe",
+		buildkite.NewClient("tok"),
+		"myorg",
 		secret, mode,
 		logger,
 	)
@@ -74,7 +74,7 @@ func TestBuildkiteSpawn(t *testing.T) {
 		},
 	}
 	workflows := []*tangled.Pipeline_Workflow{
-		{Name: "test.yml", Raw: "steps:\n  - run: true\n"},
+		{Name: "test.yml", Raw: "tack:\n  buildkite:\n    pipeline: mypipe\n"},
 	}
 
 	p.Spawn(context.Background(), "knot.example.com", "rkey-1", trigger, workflows)
@@ -139,13 +139,133 @@ func TestBuildkiteSpawnNoCommit(t *testing.T) {
 
 	p.Spawn(context.Background(), "knot.example.com", "rkey-1",
 		&tangled.Pipeline_TriggerMetadata{Manual: &tangled.Pipeline_ManualTriggerData{}},
-		[]*tangled.Pipeline_Workflow{{Name: "test.yml"}},
+		[]*tangled.Pipeline_Workflow{{Name: "test.yml",
+			Raw: "tack:\n  buildkite:\n    pipeline: mypipe\n"}},
 	)
 
 	// Give any rogue goroutine a moment.
 	time.Sleep(50 * time.Millisecond)
 	if called {
 		t.Fatal("CreateBuild called despite missing commit")
+	}
+	rows, _ := st.EventsAfter(context.Background(), 0)
+	if len(rows) != 0 {
+		t.Fatalf("got %d events, want 0", len(rows))
+	}
+}
+
+// TestBuildkiteSpawnWorkflowConfig pins the YAML → create-build
+// translation: pipeline + org from YAML pick the request URL,
+// message/env/meta_data come through, and the trigger's PR target
+// branch lands as `pull_request_base_branch`. Together these cover
+// the "smuggle Buildkite parameters through workflow YAML" path.
+func TestBuildkiteSpawnWorkflowConfig(t *testing.T) {
+	type captured struct {
+		path string
+		body buildkite.CreateBuildRequest
+	}
+	gotCh := make(chan captured, 1)
+	bk := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body buildkite.CreateBuildRequest
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		gotCh <- captured{path: r.URL.Path, body: body}
+		w.WriteHeader(http.StatusCreated)
+		_ = json.NewEncoder(w).Encode(buildkite.Build{ID: "uuid-9", Number: 9})
+	})
+	p, _, _, _ := newBuildkiteTestProvider(t, buildkite.WebhookModeToken, "s", bk)
+
+	raw := strings.Join([]string{
+		"pipeline: workflow-pipe",
+		"org: workflow-org",
+		"message: smuggled message",
+		"env:",
+		"  CUSTOM: value",
+		"meta_data:",
+		"  custom: meta",
+		"clean_checkout: true",
+		"author:",
+		"  name: Author",
+		"  email: a@example.com",
+	}, "\n") + "\n"
+
+	trigger := &tangled.Pipeline_TriggerMetadata{
+		PullRequest: &tangled.Pipeline_PullRequestTriggerData{
+			SourceSha:    "deadbeef",
+			SourceBranch: "feature",
+			TargetBranch: "main",
+		},
+	}
+
+	p.Spawn(context.Background(), "knot.example.com", "rkey-x", trigger,
+		[]*tangled.Pipeline_Workflow{{Name: "ci.yml", Raw: raw}})
+
+	select {
+	case got := <-gotCh:
+		// URL must reflect YAML org + pipeline.
+		if !strings.Contains(got.path, "/organizations/workflow-org/pipelines/workflow-pipe/") {
+			t.Fatalf("path = %q", got.path)
+		}
+		if got.body.Commit != "deadbeef" || got.body.Branch != "feature" {
+			t.Fatalf("commit/branch = %q/%q", got.body.Commit, got.body.Branch)
+		}
+		if got.body.Message != "smuggled message" {
+			t.Fatalf("message = %q", got.body.Message)
+		}
+		if got.body.Env["CUSTOM"] != "value" {
+			t.Fatalf("env[CUSTOM] missing: %+v", got.body.Env)
+		}
+		// tack defaults must still be present (user keys merge,
+		// don't replace).
+		if got.body.Env["TACK_WORKFLOW"] != "ci.yml" {
+			t.Fatalf("env[TACK_WORKFLOW] missing: %+v", got.body.Env)
+		}
+		if got.body.MetaData["custom"] != "meta" ||
+			got.body.MetaData[bkMetaWorkflow] != "ci.yml" {
+			t.Fatalf("meta_data wrong: %+v", got.body.MetaData)
+		}
+		if !got.body.CleanCheckout {
+			t.Fatalf("clean_checkout not set")
+		}
+		// IgnorePipelineBranchFilters defaults to true (see
+		// workflowConfig comment).
+		if !got.body.IgnorePipelineBranchFilters {
+			t.Fatalf("ignore_pipeline_branch_filters not defaulted to true")
+		}
+		if got.body.PullRequestBaseBranch != "main" {
+			t.Fatalf("pr base branch = %q; want main",
+				got.body.PullRequestBaseBranch)
+		}
+		if got.body.Author == nil || got.body.Author.Email != "a@example.com" {
+			t.Fatalf("author = %+v", got.body.Author)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("CreateBuild not called")
+	}
+}
+
+// TestBuildkiteSpawnInvalidYAML proves a workflow without the
+// required `pipeline` field is skipped — no API call, no DB row, no
+// status. A misconfigured workflow shouldn't be silently swept onto
+// some default pipeline.
+func TestBuildkiteSpawnInvalidYAML(t *testing.T) {
+	called := false
+	bk := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		called = true
+	})
+	p, st, _, _ := newBuildkiteTestProvider(t, buildkite.WebhookModeToken, "s", bk)
+
+	p.Spawn(context.Background(), "knot.example.com", "rkey-z",
+		&tangled.Pipeline_TriggerMetadata{
+			Push: &tangled.Pipeline_PushTriggerData{NewSha: "abc", Ref: "refs/heads/main"},
+		},
+		[]*tangled.Pipeline_Workflow{
+			{Name: "broken.yml", Raw: "steps:\n  - run: true\n"},
+		},
+	)
+
+	time.Sleep(50 * time.Millisecond)
+	if called {
+		t.Fatal("CreateBuild called for workflow missing pipeline")
 	}
 	rows, _ := st.EventsAfter(context.Background(), 0)
 	if len(rows) != 0 {

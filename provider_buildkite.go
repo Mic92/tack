@@ -9,14 +9,12 @@ package main
 // Spawn time and publishes a sh.tangled.pipeline.status record on
 // the in-process broker.
 //
-// Only one Buildkite pipeline is used per spindle (TACK_BUILDKITE_PIPELINE).
-// Every Tangled workflow runs as a build on that single pipeline, with
-// the workflow identity plumbed through env + meta_data. The operator
-// configures their Buildkite pipeline to read those env vars and
-// dispatch accordingly (e.g. via `pipeline upload`). Mapping every
-// Tangled workflow to its own Buildkite pipeline would force operators
-// to provision Buildkite resources for each workflow file in every
-// repo that points at the spindle — friction we don't want to impose.
+// The Buildkite *pipeline slug* a workflow targets is carried inside
+// the workflow's YAML body (Pipeline_Workflow.Raw), not configured
+// globally on the spindle. That keeps tack a thin translator: the
+// repo author decides which Buildkite pipeline runs each Tangled
+// workflow without an operator round-trip. See workflowConfig below
+// for the supported YAML schema.
 
 import (
 	"context"
@@ -28,6 +26,7 @@ import (
 	"strings"
 	"time"
 
+	"go.yaml.in/yaml/v2"
 	"tangled.org/core/api/tangled"
 
 	"github.com/mitchellh/tack/internal/buildkite"
@@ -44,6 +43,67 @@ const (
 	bkMetaWorkflow     = "tack:workflow"
 )
 
+// workflowConfig is the tack-flavoured schema we expect inside each
+// Tangled workflow's Raw YAML body. Only the Buildkite `pipeline`
+// slug is required; everything else is optional. Fields nest under
+// `tack: { buildkite: ... }` so the workflow YAML can grow other
+// top-level keys (Tangled's own scheduling fields, future provider
+// blocks) without colliding with our namespace.
+//
+// Fields map onto the Buildkite REST "Create a build" request
+// properties documented at
+// https://buildkite.com/docs/apis/rest-api/builds#create-a-build
+// (see also the comment block on buildkite.CreateBuildRequest). We
+// expose only the small subset users genuinely need to override —
+// trigger metadata supplies commit/branch, and tack supplies the
+// identity env+meta the webhook handler relies on, so there's no
+// reason to let users re-specify those.
+type workflowConfig struct {
+	Tack tackConfig `yaml:"tack"`
+}
+
+// tackConfig is the per-provider block under the top-level `tack:`
+// key. Right now the only nested provider is Buildkite.
+type tackConfig struct {
+	Buildkite buildkiteConfig `yaml:"buildkite"`
+}
+
+// buildkiteConfig is the Buildkite-specific subset of workflowConfig.
+//
+// `org` lets a workflow target a Buildkite organisation other than
+// the spindle's default — useful when one tack instance fronts
+// multiple orgs. The configured API token must have access to that
+// org or the build creation request will 401/403; we surface that
+// error verbatim rather than guessing.
+//
+// `clean_checkout` is forwarded verbatim to Buildkite. CleanCheckout
+// is a *bool so omitting it leaves Buildkite's own default in place
+// instead of always shipping `false`.
+type buildkiteConfig struct {
+	Pipeline      string `yaml:"pipeline"`
+	Org           string `yaml:"org"`
+	CleanCheckout *bool  `yaml:"clean_checkout"`
+}
+
+// parseWorkflowConfig decodes a workflow YAML body into workflowConfig.
+// An empty body is treated as a structural error so spawnWorkflow can
+// short-circuit cleanly: a workflow with no body has nothing for tack
+// to do anyway.
+func parseWorkflowConfig(raw string) (*buildkiteConfig, error) {
+	if strings.TrimSpace(raw) == "" {
+		return nil, errors.New("workflow body is empty")
+	}
+	var cfg workflowConfig
+	if err := yaml.Unmarshal([]byte(raw), &cfg); err != nil {
+		return nil, fmt.Errorf("parse workflow yaml: %w", err)
+	}
+	bk := cfg.Tack.Buildkite
+	if bk.Pipeline == "" {
+		return nil, errors.New("workflow yaml: `tack.buildkite.pipeline` is required")
+	}
+	return &bk, nil
+}
+
 // buildkiteProvider implements Provider.
 //
 // webhookSecret + webhookMode live on the provider rather than on
@@ -51,12 +111,16 @@ const (
 // "everything Buildkite-y": colocating the auth knob with the API
 // client and the state translator keeps configuration drift to one
 // place and makes the http.go side pure transport.
+//
+// defaultOrg is the Buildkite organisation the configured API token
+// belongs to. Workflows may opt into a different org via their YAML
+// `org` field; the API token then needs to be authorised against it.
 type buildkiteProvider struct {
 	br            *broker
 	st            *store
 	log           *slog.Logger
 	client        *buildkite.Client
-	pipelineSlug  string
+	defaultOrg    string
 	webhookSecret string
 	webhookMode   buildkite.WebhookMode
 }
@@ -65,15 +129,15 @@ type buildkiteProvider struct {
 var _ Provider = (*buildkiteProvider)(nil)
 
 // newBuildkiteProvider wires a provider to its Buildkite client and
-// to the broker it publishes pipeline.status records on. pipelineSlug
-// is the Buildkite pipeline that all builds get fired on (see file
-// header for why there's only one). webhookSecret/webhookMode govern
-// inbound /webhooks/buildkite request authentication.
+// to the broker it publishes pipeline.status records on. defaultOrg
+// is the org the API token authenticates against and the org used
+// when a workflow doesn't specify its own. webhookSecret/webhookMode
+// govern inbound /webhooks/buildkite request authentication.
 func newBuildkiteProvider(
 	br *broker,
 	st *store,
 	client *buildkite.Client,
-	pipelineSlug string,
+	defaultOrg string,
 	webhookSecret string,
 	webhookMode buildkite.WebhookMode,
 	log *slog.Logger,
@@ -83,7 +147,7 @@ func newBuildkiteProvider(
 		st:            st,
 		log:           log.With("component", "provider", "kind", "buildkite"),
 		client:        client,
-		pipelineSlug:  pipelineSlug,
+		defaultOrg:    defaultOrg,
 		webhookSecret: webhookSecret,
 		webhookMode:   webhookMode,
 	}
@@ -111,10 +175,10 @@ func (p *buildkiteProvider) VerifyWebhook(headers http.Header, body []byte) erro
 }
 
 // Spawn satisfies Provider. For each workflow it fires a separate
-// Buildkite build off the configured pipeline so each workflow gets
-// its own status timeline. The actual API call runs on a goroutine —
-// CreateBuild is one HTTP round-trip, but we still want Spawn to be
-// non-blocking per the interface contract.
+// Buildkite build off the pipeline named in that workflow's YAML so
+// each workflow gets its own status timeline. The actual API call
+// runs on a goroutine — CreateBuild is one HTTP round-trip, but we
+// still want Spawn to be non-blocking per the interface contract.
 //
 // On a successful create we persist the build UUID → (knot, rkey,
 // workflow) mapping and publish a "pending" pipeline.status so the
@@ -134,26 +198,12 @@ func (p *buildkiteProvider) Spawn(
 		return
 	}
 
-	// Derive build inputs once. Every workflow on this trigger
-	// targets the same commit/branch — only the workflow name
-	// varies between the per-workflow goroutines below.
-	commit, branch := triggerCommitAndBranch(trigger)
-	if commit == "" {
-		// Buildkite's create-build API requires a commit; we'd
-		// rather log loudly and skip than fire builds on "HEAD"
-		// and silently get whatever main happens to look like.
-		p.log.Error("trigger has no commit; refusing to spawn",
-			"knot", knot, "rkey", pipelineRkey,
-		)
-		return
-	}
-
 	for _, wf := range workflows {
 		if wf == nil || wf.Name == "" {
 			continue
 		}
 		wf := wf
-		go p.spawnWorkflow(ctx, knot, pipelineRkey, commit, branch, wf)
+		go p.spawnWorkflow(ctx, knot, pipelineRkey, trigger, wf)
 	}
 }
 
@@ -166,8 +216,7 @@ func (p *buildkiteProvider) spawnWorkflow(
 	ctx context.Context,
 	knot string,
 	pipelineRkey string,
-	commit string,
-	branch string,
+	trigger *tangled.Pipeline_TriggerMetadata,
 	wf *tangled.Pipeline_Workflow,
 ) {
 	logger := p.log.With(
@@ -176,38 +225,44 @@ func (p *buildkiteProvider) spawnWorkflow(
 		"workflow", wf.Name,
 	)
 
-	pipelineURI := pipelineATURI(knot, pipelineRkey)
-	meta := map[string]string{
-		bkMetaKnot:         knot,
-		bkMetaPipelineRkey: pipelineRkey,
-		bkMetaWorkflow:     wf.Name,
-	}
-	env := envFromTuple(knot, pipelineRkey, wf)
-
-	req := buildkite.CreateBuildRequest{
-		Commit:                      commit,
-		Branch:                      branch,
-		Message:                     fmt.Sprintf("tangled: %s", wf.Name),
-		Env:                         env,
-		MetaData:                    meta,
-		IgnorePipelineBranchFilters: true,
-	}
-
-	build, err := p.client.CreateBuild(ctx, p.pipelineSlug, req)
+	cfg, err := parseWorkflowConfig(wf.Raw)
 	if err != nil {
-		logger.Error("create buildkite build", "err", err)
+		// Bad workflow YAML is a user-facing config error: log it
+		// loudly and skip. Firing a build off some default would
+		// be more confusing than doing nothing.
+		logger.Error("invalid workflow config; refusing to spawn", "err", err)
+		return
+	}
+	logger = logger.With("pipeline", cfg.Pipeline)
+
+	req, err := p.buildCreateRequest(cfg, trigger, knot, pipelineRkey, wf)
+	if err != nil {
+		logger.Error("build create request", "err", err)
+		return
+	}
+
+	org := cfg.Org
+	if org == "" {
+		org = p.defaultOrg
+	}
+
+	build, err := p.client.CreateBuild(ctx, org, cfg.Pipeline, req)
+	if err != nil {
+		logger.Error("create buildkite build", "err", err, "org", org)
 		return
 	}
 	logger.Info("buildkite build created",
 		"build_uuid", build.ID,
 		"build_number", build.Number,
 		"web_url", build.WebURL,
+		"org", org,
 	)
 
+	pipelineURI := pipelineATURI(knot, pipelineRkey)
 	if err := p.st.InsertBuildkiteBuild(ctx, BuildkiteBuildRef{
 		BuildUUID:    build.ID,
 		BuildNumber:  build.Number,
-		PipelineSlug: p.pipelineSlug,
+		PipelineSlug: cfg.Pipeline,
 		Knot:         knot,
 		PipelineRkey: pipelineRkey,
 		Workflow:     wf.Name,
@@ -234,6 +289,66 @@ func (p *buildkiteProvider) spawnWorkflow(
 	}
 }
 
+// buildCreateRequest folds the parsed workflow config and the
+// Tangled trigger metadata into a single Buildkite create-build
+// payload. Trigger metadata supplies commit/branch; the workflow
+// YAML supplies the Buildkite routing knobs (pipeline/org) and the
+// small handful of build options we expose.
+//
+// `ignore_pipeline_branch_filters` is hard-coded to true: Tangled
+// refs frequently don't match arbitrary Buildkite pipeline branch
+// filters, and a build silently dropped at create time is a worse
+// failure mode than running one we shouldn't have. Users wanting
+// the filter back are expected to drop the filter on the Buildkite
+// pipeline itself.
+//
+// Returns an error when the trigger lacks a commit — Buildkite's
+// API requires one and we'd rather log+skip than fire a build that
+// resolves to "whatever main happens to be".
+func (p *buildkiteProvider) buildCreateRequest(
+	cfg *buildkiteConfig,
+	trigger *tangled.Pipeline_TriggerMetadata,
+	knot, pipelineRkey string,
+	wf *tangled.Pipeline_Workflow,
+) (buildkite.CreateBuildRequest, error) {
+	commit, branch := triggerCommitAndBranch(trigger)
+	if commit == "" {
+		return buildkite.CreateBuildRequest{}, errors.New(
+			"trigger has no commit",
+		)
+	}
+
+	cleanCheckout := false
+	if cfg.CleanCheckout != nil {
+		cleanCheckout = *cfg.CleanCheckout
+	}
+
+	req := buildkite.CreateBuildRequest{
+		Commit:  commit,
+		Branch:  branch,
+		Message: fmt.Sprintf("tangled: %s", wf.Name),
+		Env:     envFromTuple(knot, pipelineRkey, wf),
+		MetaData: map[string]string{
+			bkMetaKnot:         knot,
+			bkMetaPipelineRkey: pipelineRkey,
+			bkMetaWorkflow:     wf.Name,
+		},
+		CleanCheckout:               cleanCheckout,
+		IgnorePipelineBranchFilters: true,
+	}
+
+	// Auto-populate Buildkite's PR fields from the Tangled PR
+	// trigger when present. Buildkite doesn't get a PR number from
+	// us (Tangled doesn't surface one through the trigger), but
+	// the base branch alone is enough for `pull_request_base_branch`-
+	// gated step filters to work.
+	if trigger != nil && trigger.PullRequest != nil {
+		req.PullRequestBaseBranch = trigger.PullRequest.TargetBranch
+	}
+
+	return req, nil
+}
+
 // Logs satisfies Provider. We resolve the (knot, rkey, workflow)
 // tuple to a Buildkite build via the store, fetch the current jobs
 // list, then drain each job's plain-text log into the channel as one
@@ -256,44 +371,45 @@ func (p *buildkiteProvider) Logs(
 ) (<-chan LogLine, error) {
 	ref, err := p.st.LookupBuildkiteBuildByTuple(ctx, knot, pipelineRkey, workflow)
 	if err != nil {
-		return nil, fmt.Errorf("lookup build for logs: %w", err)
+		return nil, fmt.Errorf("lookup build mapping: %w", err)
 	}
 	if ref == nil {
 		return nil, ErrLogsNotFound
 	}
 
-	// Fresh fetch so we get the current job set, not whatever was
-	// returned at create time (when most jobs are still nil). The
-	// upstream's not-found is mapped to the Provider-shaped one
-	// here because the /logs handler only knows about ErrLogsNotFound.
-	build, err := p.client.GetBuild(ctx, ref.PipelineSlug, ref.BuildNumber)
+	// Resolve the org against which we should pull jobs/logs. We
+	// don't persist it on BuildkiteBuildRef today (the slug + token
+	// have always been enough); fall back to the provider default,
+	// which is correct for the common single-org install. A
+	// future migration can add a column when multi-org installs
+	// need it.
+	org := p.defaultOrg
+
+	build, err := p.client.GetBuild(ctx, org, ref.PipelineSlug, ref.BuildNumber)
 	if err != nil {
 		if errors.Is(err, buildkite.ErrNotFound) {
 			return nil, ErrLogsNotFound
 		}
-		return nil, fmt.Errorf("get build for logs: %w", err)
+		return nil, fmt.Errorf("get build: %w", err)
 	}
 
-	out := make(chan LogLine, 64)
+	out := make(chan LogLine, 32)
 	go func() {
 		defer close(out)
 		stepID := 0
 		for _, job := range build.Jobs {
-			// Only "script" jobs have agent-produced logs.
-			// Waiter / manual / trigger jobs have no body to
-			// fetch; skip them so we don't hit Buildkite with
-			// 404-bound requests.
 			if job.Type != "" && job.Type != "script" {
+				// Skip non-script jobs (waiter, manual,
+				// trigger). They have no log to fetch and
+				// surfacing empty steps just clutters the
+				// appview.
 				continue
 			}
-
 			name := job.Name
 			if name == "" {
-				name = job.ID
+				name = fmt.Sprintf("job %s", job.ID)
 			}
 
-			// Job-level start frame so the appview can bound
-			// timing per job.
 			if !sendLine(ctx, out, LogLine{
 				Kind:       LogKindControl,
 				Time:       time.Now(),
@@ -304,7 +420,7 @@ func (p *buildkiteProvider) Logs(
 				return
 			}
 
-			body, err := p.client.GetJobLog(ctx, ref.PipelineSlug, ref.BuildNumber, job.ID)
+			body, err := p.client.GetJobLog(ctx, org, ref.PipelineSlug, ref.BuildNumber, job.ID)
 			if err != nil {
 				p.log.Debug("fetch job log",
 					"err", err,
@@ -512,8 +628,6 @@ func triggerCommitAndBranch(trigger *tangled.Pipeline_TriggerMetadata) (string, 
 		return trigger.Push.NewSha, refToBranch(trigger.Push.Ref)
 	case trigger.PullRequest != nil:
 		// PRs build the source commit on the source branch.
-		// Buildkite's pipeline can opt into PR-aware behaviour
-		// via pull_request_id (not currently plumbed through).
 		return trigger.PullRequest.SourceSha, trigger.PullRequest.SourceBranch
 	default:
 		// Manual triggers and any future kinds: fall back to the
