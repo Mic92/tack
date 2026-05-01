@@ -115,8 +115,10 @@ func main() {
 	br := newBroker(st)
 
 	// Start the knot event-stream consumer first so the jetstream
-	// loop has somewhere to register newly-observed knots into.
-	knots, err := startKnotConsumer(ctx, cfg, st)
+	// loop has somewhere to register newly-observed knots into. It
+	// gets the broker so its (currently fake) pipeline runner can
+	// publish sh.tangled.pipeline.status events back out via /events.
+	knots, err := startKnotConsumer(ctx, cfg, st, br)
 	if err != nil {
 		logger.Error("failed to start knot consumer", "err", err)
 		os.Exit(1)
