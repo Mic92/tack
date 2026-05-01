@@ -29,7 +29,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
-	"time"
 
 	"tangled.org/core/api/tangled"
 	"tangled.org/core/eventconsumer"
@@ -74,11 +73,13 @@ type KnotConsumer interface {
 type knotConsumer struct {
 	c   *eventconsumer.Consumer
 	log *slog.Logger
-	// br is how we publish synthesized sh.tangled.pipeline.status
-	// records back out to /events subscribers. Today it's driven by
-	// the fake-job stand-in in process(); once we hook up Buildkite,
-	// the webhook handler will be the primary publisher.
-	br *broker
+
+	// provider dispatches each incoming pipeline trigger to whatever
+	// backend actually runs it (today: the fake provider; tomorrow:
+	// Buildkite). The consumer doesn't care which — it just hands
+	// over the decoded record and lets the provider publish status
+	// records back through its own broker connection.
+	provider Provider
 }
 
 // Compile-time interface conformance check.
@@ -94,7 +95,7 @@ var _ KnotConsumer = (*knotConsumer)(nil)
 // restart is harmless. When we start translating triggers into real
 // Buildkite builds, this should switch to a SQLite-backed cursor store
 // to avoid duplicate builds.
-func startKnotConsumer(ctx context.Context, cfg config, st *store, br *broker) (*knotConsumer, error) {
+func startKnotConsumer(ctx context.Context, cfg config, st *store, provider Provider) (*knotConsumer, error) {
 	logger := loggerFrom(ctx).With("component", "knotconsumer")
 
 	knots, err := st.KnotsForSpindle(ctx, cfg.Hostname)
@@ -102,7 +103,7 @@ func startKnotConsumer(ctx context.Context, cfg config, st *store, br *broker) (
 		return nil, fmt.Errorf("load known knots: %w", err)
 	}
 
-	kc := &knotConsumer{log: logger, br: br}
+	kc := &knotConsumer{log: logger, provider: provider}
 
 	ccfg := eventconsumer.NewConsumerConfig()
 	ccfg.Logger = logger
@@ -200,12 +201,11 @@ func (k *knotConsumer) process(ctx context.Context, src eventconsumer.Source, ms
 			"workflows", len(p.Workflows),
 		)
 
-		// Stand-in for the real Buildkite integration. Spawn one fake
-		// job per workflow so the /events fan-out has something to
-		// emit and the appview can show progress end to end. We hand
-		// each goroutine the worker ctx (app-scoped) so they survive
-		// process() returning but exit cleanly on shutdown.
-		k.spawnFakeJobs(ctx, src.Key(), msg.Rkey, p.Workflows)
+		// Hand the trigger to whichever Provider was configured.
+		// Spawn is non-blocking — it fans out into provider-owned
+		// goroutines so this worker can move on to the next event.
+		// The provider keeps ctx around for shutdown coordination.
+		k.provider.Spawn(ctx, src.Key(), msg.Rkey, p.Workflows)
 
 	default:
 		// Knots may publish other record types over the same stream; we
@@ -219,111 +219,5 @@ func (k *knotConsumer) process(ctx context.Context, src eventconsumer.Source, ms
 		)
 	}
 
-	return nil
-}
-
-// fakeJob constants. Pulled out so it's obvious where the timing
-// numbers come from, and trivially adjustable when we want to dial the
-// fake up or down.
-const (
-	// fakeJobDuration is the wall-clock length of a fake run. Total
-	// publishes per workflow = (fakeJobDuration / fakeJobInterval) + 1
-	// (one final "success").
-	fakeJobDuration = 30 * time.Second
-	// fakeJobInterval is how often we emit a "running" heartbeat.
-	fakeJobInterval = 5 * time.Second
-)
-
-// spawnFakeJobs starts a goroutine per workflow. They each emit a
-// stream of sh.tangled.pipeline.status records via the broker until
-// either the fake duration elapses (success) or ctx is cancelled.
-//
-// This is a deliberate stand-in: it lets us validate the entire
-// jetstream → knot → broker → /events → appview pipeline before the
-// real Buildkite plumbing is in place.
-func (k *knotConsumer) spawnFakeJobs(ctx context.Context, knot, pipelineRkey string, workflows []*tangled.Pipeline_Workflow) {
-	if len(workflows) == 0 {
-		// Nothing to fake — without a workflow name there's no valid
-		// pipeline.status record to publish.
-		k.log.Warn("pipeline has no workflows; skipping fake run",
-			"knot", knot, "rkey", pipelineRkey,
-		)
-		return
-	}
-	for _, wf := range workflows {
-		if wf == nil || wf.Name == "" {
-			continue
-		}
-		go k.runFakeJob(ctx, knot, pipelineRkey, wf.Name)
-	}
-}
-
-// runFakeJob emits a "running" status every fakeJobInterval for
-// fakeJobDuration, then a final "success". It returns early if ctx is
-// cancelled (shutdown) — without doing a final publish, since we'd be
-// writing to a broker whose store may be closing.
-func (k *knotConsumer) runFakeJob(ctx context.Context, knot, pipelineRkey, workflow string) {
-	// pipelineURI is what the appview parses out of the status record
-	// to associate it with the originating pipeline. Format mirrors
-	// what the upstream spindle emits: at://did:web:<knot>/<nsid>/<rkey>
-	// — the appview strips the did:web: prefix and uses the hostname
-	// as the knot identifier.
-	pipelineURI := fmt.Sprintf("at://did:web:%s/%s/%s",
-		knot, tangled.PipelineNSID, pipelineRkey,
-	)
-
-	logger := k.log.With(
-		"knot", knot,
-		"pipeline_rkey", pipelineRkey,
-		"workflow", workflow,
-	)
-
-	// Heartbeat phase. seq doubles as a per-workflow disambiguator in
-	// the synthesized status rkey so multiple fakes don't collide.
-	deadline := time.Now().Add(fakeJobDuration)
-	seq := 0
-	for time.Now().Before(deadline) {
-		if err := k.publishStatus(ctx, pipelineURI, workflow, "running", seq); err != nil {
-			logger.Error("publish fake running status", "err", err, "seq", seq)
-			return
-		}
-		seq++
-		select {
-		case <-ctx.Done():
-			logger.Debug("fake job cancelled mid-run", "seq", seq)
-			return
-		case <-time.After(fakeJobInterval):
-		}
-	}
-
-	// Terminal status. Marked as "success" using the upstream
-	// StatusKind enum's success label (see tangled.org/core/spindle/models).
-	if err := k.publishStatus(ctx, pipelineURI, workflow, "success", seq); err != nil {
-		logger.Error("publish fake success status", "err", err, "seq", seq)
-		return
-	}
-	logger.Info("fake job complete")
-}
-
-// publishStatus assembles a tangled.PipelineStatus, marshals it, and
-// hands it to the broker for persistence + fan-out. The rkey we mint
-// is purely synthetic — it just needs to be unique across our event
-// log; the appview keys its rows on (spindle, rkey).
-func (k *knotConsumer) publishStatus(ctx context.Context, pipelineURI, workflow, status string, seq int) error {
-	rec := tangled.PipelineStatus{
-		LexiconTypeID: tangled.PipelineStatusNSID,
-		Pipeline:      pipelineURI,
-		Workflow:      workflow,
-		Status:        status,
-		CreatedAt:     time.Now().UTC().Format(time.RFC3339),
-	}
-	body, err := json.Marshal(rec)
-	if err != nil {
-		return fmt.Errorf("marshal pipeline.status: %w", err)
-	}
-	rkey := fmt.Sprintf("fake-%d-%s-%d", time.Now().UnixNano(), workflow, seq)
-	if _, err := k.br.Publish(ctx, rkey, tangled.PipelineStatusNSID, body); err != nil {
-		return fmt.Errorf("publish pipeline.status: %w", err)
-	}
 	return nil
 }

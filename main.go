@@ -114,11 +114,19 @@ func main() {
 	// them to publish synthetic status events at startup.
 	br := newBroker(st)
 
+	// Provider that turns Tangled pipeline triggers into
+	// pipeline.status events. The fake provider stands in for a real
+	// CI integration: it emits synthetic running/success heartbeats
+	// over the broker so the entire jetstream → knot → /events flow
+	// is exercisable end-to-end. Swap this for a Buildkite-backed
+	// implementation once that lands.
+	provider := newFakeProvider(br, logger)
+
 	// Start the knot event-stream consumer first so the jetstream
 	// loop has somewhere to register newly-observed knots into. It
-	// gets the broker so its (currently fake) pipeline runner can
-	// publish sh.tangled.pipeline.status events back out via /events.
-	knots, err := startKnotConsumer(ctx, cfg, st, br)
+	// gets the provider so each incoming pipeline trigger has
+	// something to dispatch to.
+	knots, err := startKnotConsumer(ctx, cfg, st, provider)
 	if err != nil {
 		logger.Error("failed to start knot consumer", "err", err)
 		os.Exit(1)
