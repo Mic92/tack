@@ -155,10 +155,9 @@ func TestBuildkiteSpawnNoCommit(t *testing.T) {
 }
 
 // TestBuildkiteSpawnWorkflowConfig pins the YAML → create-build
-// translation: pipeline + org from YAML pick the request URL,
-// message/env/meta_data come through, and the trigger's PR target
-// branch lands as `pull_request_base_branch`. Together these cover
-// the "smuggle Buildkite parameters through workflow YAML" path.
+// translation: `tack.buildkite.{pipeline,org}` pick the request URL,
+// `clean_checkout` flows through, and the trigger's PR target
+// branch lands as `pull_request_base_branch` automatically.
 func TestBuildkiteSpawnWorkflowConfig(t *testing.T) {
 	type captured struct {
 		path string
@@ -175,17 +174,11 @@ func TestBuildkiteSpawnWorkflowConfig(t *testing.T) {
 	p, _, _, _ := newBuildkiteTestProvider(t, buildkite.WebhookModeToken, "s", bk)
 
 	raw := strings.Join([]string{
-		"pipeline: workflow-pipe",
-		"org: workflow-org",
-		"message: smuggled message",
-		"env:",
-		"  CUSTOM: value",
-		"meta_data:",
-		"  custom: meta",
-		"clean_checkout: true",
-		"author:",
-		"  name: Author",
-		"  email: a@example.com",
+		"tack:",
+		"  buildkite:",
+		"    pipeline: workflow-pipe",
+		"    org: workflow-org",
+		"    clean_checkout: true",
 	}, "\n") + "\n"
 
 	trigger := &tangled.Pipeline_TriggerMetadata{
@@ -208,35 +201,24 @@ func TestBuildkiteSpawnWorkflowConfig(t *testing.T) {
 		if got.body.Commit != "deadbeef" || got.body.Branch != "feature" {
 			t.Fatalf("commit/branch = %q/%q", got.body.Commit, got.body.Branch)
 		}
-		if got.body.Message != "smuggled message" {
-			t.Fatalf("message = %q", got.body.Message)
-		}
-		if got.body.Env["CUSTOM"] != "value" {
-			t.Fatalf("env[CUSTOM] missing: %+v", got.body.Env)
-		}
-		// tack defaults must still be present (user keys merge,
-		// don't replace).
+		// tack-managed env/meta still present.
 		if got.body.Env["TACK_WORKFLOW"] != "ci.yml" {
 			t.Fatalf("env[TACK_WORKFLOW] missing: %+v", got.body.Env)
 		}
-		if got.body.MetaData["custom"] != "meta" ||
-			got.body.MetaData[bkMetaWorkflow] != "ci.yml" {
-			t.Fatalf("meta_data wrong: %+v", got.body.MetaData)
+		if got.body.MetaData[bkMetaWorkflow] != "ci.yml" {
+			t.Fatalf("meta_data missing identity tuple: %+v", got.body.MetaData)
 		}
 		if !got.body.CleanCheckout {
 			t.Fatalf("clean_checkout not set")
 		}
-		// IgnorePipelineBranchFilters defaults to true (see
-		// workflowConfig comment).
+		// IgnorePipelineBranchFilters is hard-coded true; see
+		// buildCreateRequest comment.
 		if !got.body.IgnorePipelineBranchFilters {
-			t.Fatalf("ignore_pipeline_branch_filters not defaulted to true")
+			t.Fatalf("ignore_pipeline_branch_filters not on")
 		}
 		if got.body.PullRequestBaseBranch != "main" {
 			t.Fatalf("pr base branch = %q; want main",
 				got.body.PullRequestBaseBranch)
-		}
-		if got.body.Author == nil || got.body.Author.Email != "a@example.com" {
-			t.Fatalf("author = %+v", got.body.Author)
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("CreateBuild not called")
@@ -244,9 +226,9 @@ func TestBuildkiteSpawnWorkflowConfig(t *testing.T) {
 }
 
 // TestBuildkiteSpawnInvalidYAML proves a workflow without the
-// required `pipeline` field is skipped — no API call, no DB row, no
-// status. A misconfigured workflow shouldn't be silently swept onto
-// some default pipeline.
+// required `tack.buildkite.pipeline` field is skipped — no API
+// call, no DB row, no status. A misconfigured workflow shouldn't
+// be silently swept onto some default pipeline.
 func TestBuildkiteSpawnInvalidYAML(t *testing.T) {
 	called := false
 	bk := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -265,7 +247,7 @@ func TestBuildkiteSpawnInvalidYAML(t *testing.T) {
 
 	time.Sleep(50 * time.Millisecond)
 	if called {
-		t.Fatal("CreateBuild called for workflow missing pipeline")
+		t.Fatal("CreateBuild called for workflow missing tack.buildkite.pipeline")
 	}
 	rows, _ := st.EventsAfter(context.Background(), 0)
 	if len(rows) != 0 {
