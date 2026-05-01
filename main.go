@@ -23,6 +23,7 @@ type config struct {
 	Addr         string
 	OwnerDID     string
 	JetstreamURL string
+	DBPath       string
 }
 
 func loadConfig() (config, error) {
@@ -30,6 +31,7 @@ func loadConfig() (config, error) {
 		Addr:         envOr("TACK_LISTEN_ADDR", ":8080"),
 		OwnerDID:     os.Getenv("TACK_OWNER_DID"),
 		JetstreamURL: envOr("TACK_JETSTREAM_URL", "wss://jetstream1.us-west.bsky.network/subscribe"),
+		DBPath:       envOr("TACK_DB_PATH", "tack.db"),
 	}
 	addrFlag := flag.String("addr", cfg.Addr, "HTTP listen address (overrides TACK_LISTEN_ADDR)")
 	flag.Parse()
@@ -75,8 +77,23 @@ func main() {
 	defer stop()
 	ctx = loggerInto(ctx, logger)
 
+	// Open (or create) the SQLite store. Holds jetstream cursor +
+	// observed Tangled membership records. Closed last during shutdown
+	// so anything writing to it during teardown still succeeds.
+	st, err := openStore(cfg.DBPath)
+	if err != nil {
+		logger.Error("failed to open store", "err", err, "path", cfg.DBPath)
+		os.Exit(1)
+	}
+	defer func() {
+		if err := st.Close(); err != nil {
+			logger.Error("close store", "err", err)
+		}
+	}()
+	logger.Info("store open", "path", cfg.DBPath)
+
 	// Start the JetStream listener in the background.
-	if err := startJetstream(ctx, cfg); err != nil {
+	if err := startJetstream(ctx, cfg, st); err != nil {
 		logger.Error("failed to start jetstream consumer", "err", err)
 		os.Exit(1)
 	}
