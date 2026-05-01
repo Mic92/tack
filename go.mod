@@ -1,4 +1,4 @@
-module github.com/mitchellh/tack
+module go.mitchellh.com/tack
 
 go 1.25.7
 

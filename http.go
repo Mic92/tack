@@ -31,7 +31,7 @@ import (
 	"github.com/gorilla/websocket"
 	"tangled.org/core/api/tangled"
 
-	"github.com/mitchellh/tack/internal/buildkite"
+	"go.mitchellh.com/tack/internal/buildkite"
 )
 
 // runHTTP starts the spindle's HTTP server and blocks until ctx is

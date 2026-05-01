@@ -29,7 +29,7 @@ import (
 	"go.yaml.in/yaml/v2"
 	"tangled.org/core/api/tangled"
 
-	"github.com/mitchellh/tack/internal/buildkite"
+	"go.mitchellh.com/tack/internal/buildkite"
 )
 
 // Buildkite-side meta_data keys carrying the Tangled identity of a

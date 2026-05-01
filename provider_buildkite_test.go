@@ -22,7 +22,7 @@ import (
 
 	"tangled.org/core/api/tangled"
 
-	"github.com/mitchellh/tack/internal/buildkite"
+	"go.mitchellh.com/tack/internal/buildkite"
 )
 
 // newBuildkiteTestProvider wires a buildkiteProvider against an

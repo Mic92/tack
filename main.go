@@ -16,7 +16,7 @@ import (
 
 	charmlog "github.com/charmbracelet/log"
 
-	"github.com/mitchellh/tack/internal/buildkite"
+	"go.mitchellh.com/tack/internal/buildkite"
 )
 
 // config is the runtime configuration, sourced from environment variables and
