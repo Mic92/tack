@@ -215,6 +215,16 @@ func applyRepo(ctx context.Context, st *store, knots KnotConsumer, hostname stri
 		if err := json.Unmarshal(c.Record, &rec); err != nil {
 			return fmt.Errorf("decode repo: %w", err)
 		}
+
+		// Capture the prior (knot, spindle) before the upsert so the
+		// post-mutation reconcile below can detect transitions like
+		// "repo used to point at us, no longer does" — which would
+		// otherwise leave a knot subscription dangling.
+		oldKnot, oldSpindle, err := st.GetRepo(ctx, did, c.RKey)
+		if err != nil {
+			return err
+		}
+
 		if err := st.UpsertRepo(ctx, did, c.RKey,
 			rec.Knot, rec.Name,
 			deref(rec.Spindle), deref(rec.RepoDid),
@@ -223,21 +233,79 @@ func applyRepo(ctx context.Context, st *store, knots KnotConsumer, hostname stri
 			return err
 		}
 
-		// If this repo just declared us as its spindle, start (or
-		// continue) listening to its knot for pipeline triggers. The
-		// knot consumer dedupes on its own so this is safe to call
-		// even on update events that don't change the spindle field.
-		if knots != nil && rec.Spindle != nil && *rec.Spindle == hostname && rec.Knot != "" {
-			knots.AddKnot(ctx, rec.Knot)
-		}
+		newSpindle := deref(rec.Spindle)
+		return reconcileKnot(ctx, st, knots, hostname,
+			oldKnot, oldSpindle,
+			rec.Knot, newSpindle,
+		)
 
-		return nil
 	case jsOpDelete:
-		// We don't unsubscribe from the knot here: other repos may
-		// still want us to watch it. A periodic reconciliation pass
-		// (not yet implemented) is the right place to drop unused
-		// subscriptions.
-		return st.DeleteRepo(ctx, did, c.RKey)
+		// Same shape as the update path, just with no "new" side: we
+		// have to read the row out before deleting so we can decide
+		// whether deletion freed the last hold on a knot we'd been
+		// subscribed to.
+		oldKnot, oldSpindle, err := st.GetRepo(ctx, did, c.RKey)
+		if err != nil {
+			return err
+		}
+		if err := st.DeleteRepo(ctx, did, c.RKey); err != nil {
+			return err
+		}
+		return reconcileKnot(ctx, st, knots, hostname,
+			oldKnot, oldSpindle,
+			"", "",
+		)
+	}
+	return nil
+}
+
+// reconcileKnot brings the knot consumer's subscriptions in line with
+// the latest store state after a single repo mutation. It is called
+// after the mutation has been applied so IsKnotWanted reflects the
+// post-mutation truth.
+//
+// Logic:
+//   - If the new record names us as its spindle, ensure we're
+//     subscribed to its knot (AddKnot is idempotent, so calling it on
+//     an already-watched knot is cheap).
+//   - If the old record named us as its spindle, check whether any
+//     other repo still references that knot through us; if not,
+//     RemoveKnot it. Skip this when the knot didn't change AND the
+//     spindle didn't move away from us, because then nothing actually
+//     released our hold.
+func reconcileKnot(
+	ctx context.Context,
+	st *store,
+	knots KnotConsumer,
+	hostname string,
+	oldKnot, oldSpindle string,
+	newKnot, newSpindle string,
+) error {
+	// Tests pass nil for the consumer when they only care about the
+	// store mutation half of the handler; tolerate that here so
+	// callers don't have to special-case it.
+	if knots == nil {
+		return nil
+	}
+
+	if newSpindle == hostname && newKnot != "" {
+		knots.AddKnot(ctx, newKnot)
+	}
+
+	// Did we just lose our claim on oldKnot? Two ways that can happen:
+	// the spindle field moved off of us, or the knot field moved to a
+	// different host. Either is a reason to consider unsubscribing
+	// from oldKnot — but only if no *other* repo still has us on it.
+	releasedOld := oldSpindle == hostname && oldKnot != "" &&
+		(newSpindle != hostname || newKnot != oldKnot)
+	if releasedOld {
+		stillWanted, err := st.IsKnotWanted(ctx, hostname, oldKnot)
+		if err != nil {
+			return err
+		}
+		if !stillWanted {
+			knots.RemoveKnot(ctx, oldKnot)
+		}
 	}
 	return nil
 }

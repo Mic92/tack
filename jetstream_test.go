@@ -310,3 +310,164 @@ func TestRepoEventIgnoresKnotForOtherSpindle(t *testing.T) {
 		t.Fatalf("AddKnot calls = %v, want none", added)
 	}
 }
+
+// TestRepoUpdateSpindleAwayFromUsRemovesKnot covers the case where a
+// repo we'd previously been watching gets its .spindle field flipped to
+// some other spindle. Once that's the only repo we had on that knot,
+// the reconciliation must call RemoveKnot.
+func TestRepoUpdateSpindleAwayFromUsRemovesKnot(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+
+	const ours = "tack.example"
+	const knot = "knot.example"
+
+	// Seed: a repo that names us as its spindle on `knot`.
+	if err := s.UpsertRepo(ctx, "did:plc:a", "rk", knot, "repo-a", ours, "", "t"); err != nil {
+		t.Fatal(err)
+	}
+
+	// Update: same record, now points at a different spindle.
+	other := "other.example"
+	rec := tangled.Repo{
+		Knot:      knot,
+		Name:      "repo-a",
+		Spindle:   &other,
+		CreatedAt: "2026-01-01T00:00:00Z",
+	}
+	evt := commitEvent(1, "did:plc:a", tangled.RepoNSID, jsOpUpdate, "rk", rec)
+
+	fake := &fakeKnotConsumer{}
+	if err := handleJetstreamEvent(ctx, s, fake, ours, evt); err != nil {
+		t.Fatalf("handle: %v", err)
+	}
+	if added := fake.Added(); len(added) != 0 {
+		t.Fatalf("AddKnot calls = %v, want none", added)
+	}
+	if removed := fake.Removed(); len(removed) != 1 || removed[0] != knot {
+		t.Fatalf("RemoveKnot calls = %v, want [%s]", removed, knot)
+	}
+}
+
+// TestRepoUpdateSpindleAwayFromUsKeepsKnotIfShared ensures we don't
+// over-eagerly unsubscribe from a knot when one of multiple repos on
+// that knot moves away from us. The other repo's subscription must keep
+// the knot in our wanted set.
+func TestRepoUpdateSpindleAwayFromUsKeepsKnotIfShared(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+
+	const ours = "tack.example"
+	const knot = "knot.example"
+
+	// Two repos sharing one knot, both pointed at us.
+	if err := s.UpsertRepo(ctx, "did:plc:a", "rk1", knot, "a", ours, "", "t"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.UpsertRepo(ctx, "did:plc:b", "rk2", knot, "b", ours, "", "t"); err != nil {
+		t.Fatal(err)
+	}
+
+	// Repo A flips to a different spindle. B still wants us.
+	other := "other.example"
+	rec := tangled.Repo{
+		Knot:      knot,
+		Name:      "a",
+		Spindle:   &other,
+		CreatedAt: "2026-01-01T00:00:00Z",
+	}
+	evt := commitEvent(1, "did:plc:a", tangled.RepoNSID, jsOpUpdate, "rk1", rec)
+
+	fake := &fakeKnotConsumer{}
+	if err := handleJetstreamEvent(ctx, s, fake, ours, evt); err != nil {
+		t.Fatalf("handle: %v", err)
+	}
+	if removed := fake.Removed(); len(removed) != 0 {
+		t.Fatalf("RemoveKnot calls = %v, want none (B still wants us on %s)", removed, knot)
+	}
+}
+
+// TestRepoUpdateChangingKnotSwapsSubscription verifies that a repo
+// staying with us but changing its .knot field unsubscribes the old
+// knot (if no other repo holds it) and subscribes the new one.
+func TestRepoUpdateChangingKnotSwapsSubscription(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+
+	const ours = "tack.example"
+	const oldKnot = "old.example"
+	const newKnot = "new.example"
+
+	if err := s.UpsertRepo(ctx, "did:plc:a", "rk", oldKnot, "a", ours, "", "t"); err != nil {
+		t.Fatal(err)
+	}
+
+	spindle := ours
+	rec := tangled.Repo{
+		Knot:      newKnot,
+		Name:      "a",
+		Spindle:   &spindle,
+		CreatedAt: "2026-01-01T00:00:00Z",
+	}
+	evt := commitEvent(1, "did:plc:a", tangled.RepoNSID, jsOpUpdate, "rk", rec)
+
+	fake := &fakeKnotConsumer{}
+	if err := handleJetstreamEvent(ctx, s, fake, ours, evt); err != nil {
+		t.Fatalf("handle: %v", err)
+	}
+	if added := fake.Added(); len(added) != 1 || added[0] != newKnot {
+		t.Fatalf("AddKnot calls = %v, want [%s]", added, newKnot)
+	}
+	if removed := fake.Removed(); len(removed) != 1 || removed[0] != oldKnot {
+		t.Fatalf("RemoveKnot calls = %v, want [%s]", removed, oldKnot)
+	}
+}
+
+// TestRepoDeleteRemovesKnotWhenLast confirms deleting the last repo on
+// a knot we cared about triggers RemoveKnot.
+func TestRepoDeleteRemovesKnotWhenLast(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+
+	const ours = "tack.example"
+	const knot = "knot.example"
+
+	if err := s.UpsertRepo(ctx, "did:plc:a", "rk", knot, "a", ours, "", "t"); err != nil {
+		t.Fatal(err)
+	}
+	evt := commitEvent(1, "did:plc:a", tangled.RepoNSID, jsOpDelete, "rk", nil)
+
+	fake := &fakeKnotConsumer{}
+	if err := handleJetstreamEvent(ctx, s, fake, ours, evt); err != nil {
+		t.Fatalf("handle: %v", err)
+	}
+	if removed := fake.Removed(); len(removed) != 1 || removed[0] != knot {
+		t.Fatalf("RemoveKnot calls = %v, want [%s]", removed, knot)
+	}
+}
+
+// TestRepoDeleteKeepsKnotIfShared ensures deleting one of multiple
+// repos on a knot does not unsubscribe — the survivors still want it.
+func TestRepoDeleteKeepsKnotIfShared(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+
+	const ours = "tack.example"
+	const knot = "knot.example"
+
+	if err := s.UpsertRepo(ctx, "did:plc:a", "rk1", knot, "a", ours, "", "t"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.UpsertRepo(ctx, "did:plc:b", "rk2", knot, "b", ours, "", "t"); err != nil {
+		t.Fatal(err)
+	}
+	evt := commitEvent(1, "did:plc:a", tangled.RepoNSID, jsOpDelete, "rk1", nil)
+
+	fake := &fakeKnotConsumer{}
+	if err := handleJetstreamEvent(ctx, s, fake, ours, evt); err != nil {
+		t.Fatalf("handle: %v", err)
+	}
+	if removed := fake.Removed(); len(removed) != 0 {
+		t.Fatalf("RemoveKnot calls = %v, want none", removed)
+	}
+}

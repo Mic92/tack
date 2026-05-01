@@ -194,6 +194,45 @@ func (s *store) UpsertRepoCollaborator(ctx context.Context, did, rkey, repo, rep
 	return nil
 }
 
+// GetRepo returns the (knot, spindle) currently stored for a (did, rkey)
+// pair. Both are returned as empty strings when no row exists; callers
+// that need to distinguish "absent" from "stored but empty" should
+// pre-check existence themselves.
+//
+// This exists so applyRepo can read the *previous* spindle/knot of a
+// record before applying a mutation, which is what makes it possible to
+// detect transitions like "this repo used to be ours, now it isn't" and
+// trigger a knot unsubscribe.
+func (s *store) GetRepo(ctx context.Context, did, rkey string) (knot, spindle string, err error) {
+	err = s.db.QueryRowContext(ctx,
+		`SELECT knot, spindle FROM repos WHERE did = ? AND rkey = ?`,
+		did, rkey,
+	).Scan(&knot, &spindle)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", "", nil
+	}
+	if err != nil {
+		return "", "", fmt.Errorf("get repo: %w", err)
+	}
+	return knot, spindle, nil
+}
+
+// IsKnotWanted reports whether any repo currently stored still names the
+// given hostname as its spindle and the given knot as its host. After a
+// repo update or delete this is the question we ask to decide whether
+// to keep watching that knot or unsubscribe from it.
+func (s *store) IsKnotWanted(ctx context.Context, hostname, knot string) (bool, error) {
+	var n int
+	err := s.db.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM repos WHERE spindle = ? AND knot = ?`,
+		hostname, knot,
+	).Scan(&n)
+	if err != nil {
+		return false, fmt.Errorf("count repos for knot: %w", err)
+	}
+	return n > 0, nil
+}
+
 // KnotsForSpindle returns the distinct knot hostnames of all repos that
 // have declared the given spindle hostname as their CI spindle. The knot
 // event-stream subscriber uses this to decide which knots to dial.
