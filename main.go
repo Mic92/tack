@@ -143,7 +143,7 @@ func main() {
 
 	// Run the HTTP server. This blocks until ctx is cancelled or the
 	// listener errors.
-	if err := runHTTP(ctx, cfg, br); err != nil {
+	if err := runHTTP(ctx, cfg, br, provider); err != nil {
 		logger.Error("http server error", "err", err)
 		os.Exit(1)
 	}

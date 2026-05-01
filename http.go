@@ -2,7 +2,7 @@ package main
 
 // HTTP surface of the spindle.
 //
-// Three roles to keep in mind:
+// Four roles to keep in mind:
 //
 //  1. Verification: the Tangled appview hits /xrpc/sh.tangled.owner during
 //     spindle registration to confirm the operator owns this instance.
@@ -13,6 +13,9 @@ package main
 //  3. Webhooks: Buildkite POSTs build/job state changes to
 //     /webhooks/buildkite, which we'll translate into pipeline.status
 //     events on (2).
+//  4. Logs: GET /logs/{knot}/{pipelineRkey}/{workflow} delegates to the
+//     configured Provider so the appview (or a curling operator) can
+//     pull captured workflow output for a specific run.
 
 import (
 	"context"
@@ -35,12 +38,13 @@ import (
 // The logger is read from ctx via loggerFrom. The broker is the
 // in-process pub/sub used by /events to fan published records out to
 // connected websocket subscribers.
-func runHTTP(ctx context.Context, cfg config, br *broker) error {
+func runHTTP(ctx context.Context, cfg config, br *broker, provider Provider) error {
 	logger := loggerFrom(ctx)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /", rootHandler())
 	mux.HandleFunc("GET /events", eventsHandler(logger, br))
+	mux.HandleFunc("GET /logs/{knot}/{pipelineRkey}/{workflow}", logsHandler(logger, provider))
 	mux.HandleFunc("GET /xrpc/"+tangled.OwnerNSID, ownerHandler(logger, cfg.OwnerDID))
 	mux.HandleFunc("POST /webhooks/buildkite", buildkiteWebhookHandler())
 
@@ -97,6 +101,149 @@ func ownerHandler(logger *slog.Logger, owner string) http.HandlerFunc {
 func buildkiteWebhookHandler() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "not implemented", http.StatusNotImplemented)
+	}
+}
+
+// logsHandler serves captured workflow logs over a WebSocket,
+// matching the wire protocol of the upstream Tangled spindle so the
+// appview's log proxy (appview/pipelines.Logs) treats us as a drop-in
+// source. The path shape is
+//
+//	GET /logs/{knot}/{pipelineRkey}/{workflow}
+//
+// which matches the (knot, pipelineRkey, workflow) tuple
+// Provider.Spawn is invoked with — the same identity used in the
+// pipeline ATURI. Workflow names commonly contain a dot (e.g.
+// "test.yml"); ServeMux path patterns match a single segment, so the
+// literal value flows straight through r.PathValue.
+//
+// Wire shape per frame: a single TextMessage carrying one JSON
+// LogLine record (defined in provider.go; byte-compatible with
+// tangled.org/core/spindle/models.LogLine). The Provider hands us a
+// channel of LogLine values; we marshal each one and forward it as
+// one frame so the appview's per-line decode path works unchanged.
+//
+// Error mapping is intentionally done *before* the WebSocket upgrade:
+// ErrLogsNotFound becomes 404 and any other Logs() error becomes 500
+// so the appview's websocket.DefaultDialer surfaces a real HTTP
+// status rather than an immediate close.
+func logsHandler(logger *slog.Logger, provider Provider) http.HandlerFunc {
+	upgrader := websocket.Upgrader{
+		ReadBufferSize:  1024,
+		WriteBufferSize: 1024,
+	}
+	return func(w http.ResponseWriter, r *http.Request) {
+		knot := r.PathValue("knot")
+		pipelineRkey := r.PathValue("pipelineRkey")
+		workflow := r.PathValue("workflow")
+
+		// Defensive: ServeMux won't match an empty segment, but a
+		// future router change shouldn't be allowed to silently
+		// produce an "all logs" query.
+		if knot == "" || pipelineRkey == "" || workflow == "" {
+			http.Error(w, "missing path component", http.StatusBadRequest)
+			return
+		}
+
+		// Establish the log channel BEFORE the WebSocket upgrade so
+		// ErrLogsNotFound / backend errors surface as a real HTTP
+		// status to the appview's dialer rather than as an immediate
+		// post-upgrade close. ctx scopes the producer's lifetime —
+		// it's cancelled below the moment the client disconnects.
+		ctx, cancel := context.WithCancel(r.Context())
+		defer cancel()
+
+		ch, err := provider.Logs(ctx, knot, pipelineRkey, workflow)
+		if err != nil {
+			if errors.Is(err, ErrLogsNotFound) {
+				http.Error(w, "logs not found", http.StatusNotFound)
+				return
+			}
+			logger.Error("logs fetch failed",
+				"err", err,
+				"knot", knot,
+				"pipeline_rkey", pipelineRkey,
+				"workflow", workflow,
+			)
+			http.Error(w, "logs unavailable", http.StatusInternalServerError)
+			return
+		}
+
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			// Upgrade already wrote a response; just record the
+			// failure for diagnostics.
+			logger.Error("logs websocket upgrade failed",
+				"err", err,
+				"knot", knot,
+				"pipeline_rkey", pipelineRkey,
+				"workflow", workflow,
+			)
+			return
+		}
+		defer func() {
+			// Send a close frame on the way out so the appview proxy
+			// sees a clean shutdown. Mirrors upstream
+			// spindle.(*Spindle).Logs.
+			_ = conn.WriteControl(
+				websocket.CloseMessage,
+				websocket.FormatCloseMessage(
+					websocket.CloseNormalClosure, "log stream complete",
+				),
+				time.Now().Add(time.Second),
+			)
+			conn.Close()
+		}()
+
+		// Detect client disconnect by trying to read; we don't expect
+		// any payloads from the client, so any read outcome (including
+		// EOF) signals the connection has gone away. The cancel hits
+		// the producer goroutine inside the Provider, which stops
+		// sending and closes ch — our drain loop then exits cleanly.
+		go func() {
+			for {
+				if _, _, err := conn.NextReader(); err != nil {
+					cancel()
+					return
+				}
+			}
+		}()
+
+		// Drain the channel; closure means the run is complete (or
+		// the producer hit ctx). Marshal-then-write each LogLine as
+		// a single TextMessage frame.
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case line, ok := <-ch:
+				if !ok {
+					return
+				}
+				frame, err := json.Marshal(line)
+				if err != nil {
+					// The struct is fully internal; a marshal failure
+					// is a programmer bug. Log and bail rather than
+					// poison the stream with a half-frame.
+					logger.Error("marshal log line",
+						"err", err,
+						"knot", knot,
+						"pipeline_rkey", pipelineRkey,
+						"workflow", workflow,
+					)
+					return
+				}
+				if err := conn.WriteMessage(websocket.TextMessage, frame); err != nil {
+					logger.Debug("logs frame write failed",
+						"err", err,
+						"knot", knot,
+						"pipeline_rkey", pipelineRkey,
+						"workflow", workflow,
+					)
+					return
+				}
+			}
+		}
 	}
 }
 
