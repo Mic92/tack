@@ -205,7 +205,7 @@ func (k *knotConsumer) process(ctx context.Context, src eventconsumer.Source, ms
 		// Spawn is non-blocking — it fans out into provider-owned
 		// goroutines so this worker can move on to the next event.
 		// The provider keeps ctx around for shutdown coordination.
-		k.provider.Spawn(ctx, src.Key(), msg.Rkey, p.Workflows)
+		k.provider.Spawn(ctx, src.Key(), msg.Rkey, p.TriggerMetadata, p.Workflows)
 
 	default:
 		// Knots may publish other record types over the same stream; we

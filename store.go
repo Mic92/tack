@@ -322,6 +322,109 @@ func (s *store) InsertEvent(ctx context.Context, rkey, nsid string, eventJSON []
 	return id, nil
 }
 
+// BuildkiteBuildRef is the persisted mapping from one Buildkite build
+// to the Tangled pipeline tuple that spawned it. It's the row written
+// by the Buildkite provider at Spawn time and read back from two
+// places: the webhook handler (by build UUID) when an event arrives,
+// and the /logs handler (by knot+rkey+workflow) when an appview
+// client asks for output.
+type BuildkiteBuildRef struct {
+	BuildUUID     string
+	BuildNumber   int64
+	PipelineSlug  string
+	Knot          string
+	PipelineRkey  string
+	Workflow      string
+	PipelineURI   string
+}
+
+// InsertBuildkiteBuild records that a Buildkite build was created on
+// behalf of the given (knot, pipelineRkey, workflow) tuple. Uses
+// INSERT OR REPLACE so that an unlikely build-uuid collision (or a
+// Buildkite-side rebuild that re-fires us) just refreshes the row
+// instead of failing.
+func (s *store) InsertBuildkiteBuild(ctx context.Context, ref BuildkiteBuildRef) error {
+	_, err := s.db.ExecContext(ctx,
+		`INSERT INTO buildkite_builds (
+            build_uuid, build_number, pipeline_slug,
+            knot, pipeline_rkey, workflow,
+            pipeline_uri, created_at
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(build_uuid) DO UPDATE SET
+             build_number  = excluded.build_number,
+             pipeline_slug = excluded.pipeline_slug,
+             knot          = excluded.knot,
+             pipeline_rkey = excluded.pipeline_rkey,
+             workflow      = excluded.workflow,
+             pipeline_uri  = excluded.pipeline_uri,
+             created_at    = excluded.created_at`,
+		ref.BuildUUID, ref.BuildNumber, ref.PipelineSlug,
+		ref.Knot, ref.PipelineRkey, ref.Workflow,
+		ref.PipelineURI, time.Now().UTC().Format(time.RFC3339Nano),
+	)
+	if err != nil {
+		return fmt.Errorf("insert buildkite_build: %w", err)
+	}
+	return nil
+}
+
+// LookupBuildkiteBuildByUUID returns the saved mapping for the given
+// Buildkite build UUID, or nil when no such build is recorded.
+// Returning a nil pointer rather than a sentinel error keeps the
+// webhook handler's "we don't know about this build" branch a simple
+// nil check.
+func (s *store) LookupBuildkiteBuildByUUID(ctx context.Context, buildUUID string) (*BuildkiteBuildRef, error) {
+	var ref BuildkiteBuildRef
+	err := s.db.QueryRowContext(ctx,
+		`SELECT build_uuid, build_number, pipeline_slug,
+                knot, pipeline_rkey, workflow, pipeline_uri
+           FROM buildkite_builds WHERE build_uuid = ?`,
+		buildUUID,
+	).Scan(
+		&ref.BuildUUID, &ref.BuildNumber, &ref.PipelineSlug,
+		&ref.Knot, &ref.PipelineRkey, &ref.Workflow, &ref.PipelineURI,
+	)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("lookup buildkite_build by uuid: %w", err)
+	}
+	return &ref, nil
+}
+
+// LookupBuildkiteBuildByTuple finds the most recently created build
+// for (knot, pipelineRkey, workflow). Returns nil when no build has
+// been recorded for that tuple — used by /logs to translate the
+// appview's path-based identity back into something Buildkite knows.
+//
+// "Most recent" matters because a workflow may have multiple builds
+// over time (rebuilds, re-triggers). We always serve logs for the
+// latest run; older runs are still queryable by build UUID directly
+// if anyone ever wants that.
+func (s *store) LookupBuildkiteBuildByTuple(ctx context.Context, knot, pipelineRkey, workflow string) (*BuildkiteBuildRef, error) {
+	var ref BuildkiteBuildRef
+	err := s.db.QueryRowContext(ctx,
+		`SELECT build_uuid, build_number, pipeline_slug,
+                knot, pipeline_rkey, workflow, pipeline_uri
+           FROM buildkite_builds
+          WHERE knot = ? AND pipeline_rkey = ? AND workflow = ?
+          ORDER BY created_at DESC
+          LIMIT 1`,
+		knot, pipelineRkey, workflow,
+	).Scan(
+		&ref.BuildUUID, &ref.BuildNumber, &ref.PipelineSlug,
+		&ref.Knot, &ref.PipelineRkey, &ref.Workflow, &ref.PipelineURI,
+	)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("lookup buildkite_build by tuple: %w", err)
+	}
+	return &ref, nil
+}
+
 // EventsAfter returns every event row with `created` strictly greater
 // than cursor, in cursor order. Used by /events to backfill a
 // reconnecting subscriber and to drain newly-published rows on each

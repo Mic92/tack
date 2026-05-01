@@ -8,12 +8,15 @@ import (
 	"context"
 	"errors"
 	"flag"
+	"fmt"
 	"log/slog"
 	"os"
 	"os/signal"
 	"syscall"
 
 	charmlog "github.com/charmbracelet/log"
+
+	"github.com/mitchellh/tack/internal/buildkite"
 )
 
 // config is the runtime configuration, sourced from environment variables and
@@ -28,16 +31,34 @@ type config struct {
 	// Dev flips the knot event-stream scheme from wss:// to ws://.
 	// Useful when running against a local knot during development.
 	Dev bool
+
+	// Buildkite-mode configuration. BuildkiteToken is the switch:
+	// when empty we fall back to the in-process fake provider
+	// (useful for local development against a real Tangled
+	// jetstream); when set, the other Buildkite fields are
+	// required and tack will refuse to start without them.
+	BuildkiteToken         string
+	BuildkiteOrg           string
+	BuildkitePipeline      string
+	BuildkiteWebhookSecret string
+	BuildkiteWebhookMode   buildkite.WebhookMode
 }
 
 func loadConfig() (config, error) {
 	cfg := config{
-		Addr:         envOr("TACK_LISTEN_ADDR", ":8080"),
-		Hostname:     os.Getenv("TACK_HOSTNAME"),
-		OwnerDID:     os.Getenv("TACK_OWNER_DID"),
-		JetstreamURL: envOr("TACK_JETSTREAM_URL", "wss://jetstream1.us-west.bsky.network/subscribe"),
-		DBPath:       envOr("TACK_DB_PATH", "tack.db"),
-		Dev:          os.Getenv("TACK_DEV") != "",
+		Addr:                   envOr("TACK_LISTEN_ADDR", ":8080"),
+		Hostname:               os.Getenv("TACK_HOSTNAME"),
+		OwnerDID:               os.Getenv("TACK_OWNER_DID"),
+		JetstreamURL:           envOr("TACK_JETSTREAM_URL", "wss://jetstream1.us-west.bsky.network/subscribe"),
+		DBPath:                 envOr("TACK_DB_PATH", "tack.db"),
+		Dev:                    os.Getenv("TACK_DEV") != "",
+		BuildkiteToken:         os.Getenv("TACK_BUILDKITE_TOKEN"),
+		BuildkiteOrg:           os.Getenv("TACK_BUILDKITE_ORG"),
+		BuildkitePipeline:      os.Getenv("TACK_BUILDKITE_PIPELINE"),
+		BuildkiteWebhookSecret: os.Getenv("TACK_BUILDKITE_WEBHOOK_SECRET"),
+		BuildkiteWebhookMode: buildkite.WebhookMode(
+			envOr("TACK_BUILDKITE_WEBHOOK_MODE", string(buildkite.WebhookModeToken)),
+		),
 	}
 	addrFlag := flag.String("addr", cfg.Addr, "HTTP listen address (overrides TACK_LISTEN_ADDR)")
 	flag.Parse()
@@ -54,6 +75,30 @@ func loadConfig() (config, error) {
 	// nothing.
 	if cfg.Hostname == "" {
 		return cfg, errors.New("TACK_HOSTNAME is required")
+	}
+
+	// If the operator opted into Buildkite mode (by supplying a
+	// token), every other Buildkite knob has to be present. Half-
+	// configured Buildkite leads to confusing failures deep in the
+	// provider; catch it at startup.
+	if cfg.BuildkiteToken != "" {
+		if cfg.BuildkiteOrg == "" {
+			return cfg, errors.New("TACK_BUILDKITE_ORG is required when TACK_BUILDKITE_TOKEN is set")
+		}
+		if cfg.BuildkitePipeline == "" {
+			return cfg, errors.New("TACK_BUILDKITE_PIPELINE is required when TACK_BUILDKITE_TOKEN is set")
+		}
+		if cfg.BuildkiteWebhookSecret == "" {
+			return cfg, errors.New("TACK_BUILDKITE_WEBHOOK_SECRET is required when TACK_BUILDKITE_TOKEN is set")
+		}
+		switch cfg.BuildkiteWebhookMode {
+		case buildkite.WebhookModeToken, buildkite.WebhookModeSignature:
+		default:
+			return cfg, fmt.Errorf("TACK_BUILDKITE_WEBHOOK_MODE must be %q or %q; got %q",
+				buildkite.WebhookModeToken, buildkite.WebhookModeSignature,
+				cfg.BuildkiteWebhookMode,
+			)
+		}
 	}
 
 	return cfg, nil
@@ -115,12 +160,38 @@ func main() {
 	br := newBroker(st)
 
 	// Provider that turns Tangled pipeline triggers into
-	// pipeline.status events. The fake provider stands in for a real
-	// CI integration: it emits synthetic running/success heartbeats
-	// over the broker so the entire jetstream → knot → /events flow
-	// is exercisable end-to-end. Swap this for a Buildkite-backed
-	// implementation once that lands.
-	provider := newFakeProvider(br, logger)
+	// pipeline.status events. The Buildkite provider is the real
+	// integration; the fake one stands in when no Buildkite token is
+	// configured so the full jetstream → knot → /events flow is
+	// still exercisable locally without a Buildkite account.
+	//
+	// bkProvider is kept as a typed pointer separately because the
+	// /webhooks/buildkite handler needs the concrete *buildkiteProvider
+	// (for HandleWebhook + signature verification), not the abstract
+	// Provider surface.
+	var (
+		provider   Provider
+		bkProvider *buildkiteProvider
+	)
+	if cfg.BuildkiteToken != "" {
+		bkProvider = newBuildkiteProvider(
+			br, st,
+			buildkite.NewClient(cfg.BuildkiteToken, cfg.BuildkiteOrg),
+			cfg.BuildkitePipeline,
+			cfg.BuildkiteWebhookSecret,
+			cfg.BuildkiteWebhookMode,
+			logger,
+		)
+		provider = bkProvider
+		logger.Info("buildkite provider enabled",
+			"org", cfg.BuildkiteOrg,
+			"pipeline", cfg.BuildkitePipeline,
+			"webhook_mode", cfg.BuildkiteWebhookMode,
+		)
+	} else {
+		provider = newFakeProvider(br, logger)
+		logger.Info("fake provider enabled (set TACK_BUILDKITE_TOKEN to use buildkite)")
+	}
 
 	// Start the knot event-stream consumer first so the jetstream
 	// loop has somewhere to register newly-observed knots into. It
@@ -143,7 +214,7 @@ func main() {
 
 	// Run the HTTP server. This blocks until ctx is cancelled or the
 	// listener errors.
-	if err := runHTTP(ctx, cfg, br, provider); err != nil {
+	if err := runHTTP(ctx, cfg, br, provider, bkProvider); err != nil {
 		logger.Error("http server error", "err", err)
 		os.Exit(1)
 	}

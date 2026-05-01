@@ -22,6 +22,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"strconv"
@@ -29,6 +30,8 @@ import (
 
 	"github.com/gorilla/websocket"
 	"tangled.org/core/api/tangled"
+
+	"github.com/mitchellh/tack/internal/buildkite"
 )
 
 // runHTTP starts the spindle's HTTP server and blocks until ctx is
@@ -37,8 +40,12 @@ import (
 //
 // The logger is read from ctx via loggerFrom. The broker is the
 // in-process pub/sub used by /events to fan published records out to
-// connected websocket subscribers.
-func runHTTP(ctx context.Context, cfg config, br *broker, provider Provider) error {
+// connected websocket subscribers. bkProvider may be nil — when a
+// deployment runs the fake provider, /webhooks/buildkite still
+// registers but responds 503, so a misdirected Buildkite webhook
+// gets a clear "this spindle isn't accepting Buildkite events" rather
+// than a misleading 200.
+func runHTTP(ctx context.Context, cfg config, br *broker, provider Provider, bkProvider *buildkiteProvider) error {
 	logger := loggerFrom(ctx)
 
 	mux := http.NewServeMux()
@@ -46,7 +53,7 @@ func runHTTP(ctx context.Context, cfg config, br *broker, provider Provider) err
 	mux.HandleFunc("GET /events", eventsHandler(logger, br))
 	mux.HandleFunc("GET /logs/{knot}/{pipelineRkey}/{workflow}", logsHandler(logger, provider))
 	mux.HandleFunc("GET /xrpc/"+tangled.OwnerNSID, ownerHandler(logger, cfg.OwnerDID))
-	mux.HandleFunc("POST /webhooks/buildkite", buildkiteWebhookHandler())
+	mux.HandleFunc("POST /webhooks/buildkite", buildkiteWebhookHandler(logger, bkProvider))
 
 	srv := &http.Server{
 		Addr:              cfg.Addr,
@@ -96,11 +103,75 @@ func ownerHandler(logger *slog.Logger, owner string) http.HandlerFunc {
 	}
 }
 
-// buildkiteWebhookHandler is a placeholder until we implement Buildkite ->
-// pipeline.status translation.
-func buildkiteWebhookHandler() http.HandlerFunc {
+// buildkiteWebhookHandler receives Buildkite Pipelines webhook events,
+// authenticates the request against whichever scheme the provider was
+// configured with, and hands the decoded payload to the provider for
+// translation into a sh.tangled.pipeline.status publish.
+//
+// Authentication is intentionally fail-closed: when bk is nil (no
+// Buildkite provider configured) we 503 instead of accepting events
+// silently. The body is buffered up front because signature mode
+// HMACs the raw bytes — we can't rely on the JSON decoder reading
+// the request body before verification.
+//
+// Acknowledgement contract with Buildkite: we 200 on any well-formed
+// event we accepted (including events we deliberately ignore, like
+// job.* or builds we don't track), and 5xx only on internal failure
+// the operator should look at. A 4xx/5xx makes Buildkite retry,
+// which we don't want for "this isn't an event we care about".
+func buildkiteWebhookHandler(logger *slog.Logger, bk *buildkiteProvider) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		http.Error(w, "not implemented", http.StatusNotImplemented)
+		if bk == nil {
+			http.Error(w, "buildkite provider not configured",
+				http.StatusServiceUnavailable)
+			return
+		}
+
+		// Cap body size so a malicious sender can't exhaust
+		// memory; Buildkite payloads in practice are well under
+		// 64 KiB but a generous-but-bounded ceiling is the
+		// right shape here.
+		body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+		if err != nil {
+			logger.Warn("buildkite webhook: read body", "err", err)
+			http.Error(w, "read body", http.StatusBadRequest)
+			return
+		}
+
+		if err := bk.VerifyWebhook(r.Header, body); err != nil {
+			logger.Warn("buildkite webhook: verify failed",
+				"err", err,
+				"remote", r.RemoteAddr,
+			)
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+
+		var payload buildkite.WebhookPayload
+		if err := json.Unmarshal(body, &payload); err != nil {
+			logger.Warn("buildkite webhook: decode body", "err", err)
+			http.Error(w, "bad payload", http.StatusBadRequest)
+			return
+		}
+		// The X-Buildkite-Event header is authoritative for the
+		// event name; the body field is convenience but doesn't
+		// always match exactly. Prefer the header.
+		if h := r.Header.Get("X-Buildkite-Event"); h != "" {
+			payload.Event = h
+		}
+
+		// Translate + publish on the request context so a slow
+		// store/broker doesn't outlive an aborted webhook
+		// connection.
+		if err := bk.HandleWebhook(r.Context(), payload); err != nil {
+			logger.Error("buildkite webhook: handle", "err", err,
+				"event", payload.Event,
+				"build_uuid", payload.Build.ID,
+			)
+			http.Error(w, "internal error", http.StatusInternalServerError)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
 	}
 }
 

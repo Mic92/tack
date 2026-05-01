@@ -73,7 +73,10 @@ type Provider interface {
 	// knot is the knot hostname the trigger arrived on; it's the
 	// authority half of the pipeline ATURI that pipeline.status
 	// records reference. pipelineRkey is the trigger record's rkey
-	// on that knot. workflows is the unmodified slice from the
+	// on that knot. trigger is the decoded record's TriggerMetadata
+	// (may be nil — the lexicon doesn't enforce its presence) and
+	// carries the commit/branch/PR data a real CI provider needs to
+	// kick off a build. workflows is the unmodified slice from the
 	// decoded sh.tangled.pipeline record; implementations should
 	// tolerate nil entries and zero-length names defensively, since
 	// the lexicon doesn't enforce either.
@@ -81,6 +84,7 @@ type Provider interface {
 		ctx context.Context,
 		knot string,
 		pipelineRkey string,
+		trigger *tangled.Pipeline_TriggerMetadata,
 		workflows []*tangled.Pipeline_Workflow,
 	)
 

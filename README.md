@@ -35,19 +35,35 @@ status, counts, etc. can show up inline in things like pull requests.
 go run . -addr :8080
 ```
 
-## Endpoints (planned)
+## Configuration
 
-- `GET  /events`              — WebSocket stream of pipeline status events,
-                                consumed by the Tangled appview.
-- `POST /webhooks/buildkite`  — Buildkite webhook receiver.
-- `POST /xrpc/sh.tangled.pipeline.cancelPipeline` — cancel a running build.
+### Required
 
-## Configuration (planned)
+| Env var          | Description                                                 |
+| ---------------- | ----------------------------------------------------------- |
+| `TACK_HOSTNAME`  | This spindle's hostname (matches `sh.tangled.repo.spindle`) |
+| `TACK_OWNER_DID` | DID of the spindle operator                                 |
 
-| Env var                | Description                          |
-| ---------------------- | ------------------------------------ |
-| `TACK_BUILDKITE_TOKEN` | Buildkite API token                  |
-| `TACK_BUILDKITE_ORG`   | Buildkite organization slug          |
-| `TACK_JETSTREAM_URL`   | Tangled Jetstream WebSocket URL      |
-| `TACK_DB_PATH`         | Local SQLite path for the event log  |
-| `TACK_OWNER_DID`       | DID of the spindle operator          |
+### Optional
+
+| Env var              | Description                                              |
+| -------------------- | -------------------------------------------------------- |
+| `TACK_LISTEN_ADDR`   | HTTP listen address (default `:8080`)                    |
+| `TACK_DB_PATH`       | Local SQLite path (default `tack.db`)                    |
+| `TACK_JETSTREAM_URL` | Tangled Jetstream WebSocket URL                          |
+| `TACK_DEV`           | Use `ws://` for knot event-streams (any non-empty value) |
+
+### Buildkite
+
+Setting `TACK_BUILDKITE_TOKEN` enables Buildkite mode; when unset, tack
+runs the in-process fake provider for local development. When
+Buildkite mode is enabled, every other variable in this section is
+required.
+
+| Env var                         | Description                                                                    |
+| ------------------------------- | ------------------------------------------------------------------------------ |
+| `TACK_BUILDKITE_TOKEN`          | Buildkite API token (enables Buildkite mode)                                   |
+| `TACK_BUILDKITE_ORG`            | Buildkite organization slug                                                    |
+| `TACK_BUILDKITE_PIPELINE`       | Buildkite pipeline slug to fire builds on                                      |
+| `TACK_BUILDKITE_WEBHOOK_SECRET` | Shared secret for `/webhooks/buildkite` auth                                   |
+| `TACK_BUILDKITE_WEBHOOK_MODE`   | `token` (default) or `signature` — must match Buildkite's notification setting |

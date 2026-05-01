@@ -78,6 +78,32 @@ CREATE TABLE IF NOT EXISTS events (
     event_json  TEXT NOT NULL,
     inserted_at TEXT NOT NULL
 );
+
+-- Mapping from a Buildkite build back to the Tangled pipeline that
+-- spawned it. The Buildkite webhook receiver only knows the build
+-- UUID; everything we need to publish a pipeline.status record
+-- (knot, pipeline rkey, workflow name, full pipeline ATURI) lives
+-- on this row.
+--
+-- pipeline_uri is denormalized off (knot, pipeline_rkey) so the
+-- webhook handler doesn't have to recompute the at:// string on
+-- every event — it's a constant for the lifetime of the build and
+-- the webhook is the hot path for status fan-out.
+--
+-- The (knot, pipeline_rkey, workflow) index supports the /logs
+-- handler, which only knows that tuple at request time.
+CREATE TABLE IF NOT EXISTS buildkite_builds (
+    build_uuid     TEXT PRIMARY KEY,
+    build_number   INTEGER NOT NULL,
+    pipeline_slug  TEXT NOT NULL,
+    knot           TEXT NOT NULL,
+    pipeline_rkey  TEXT NOT NULL,
+    workflow       TEXT NOT NULL,
+    pipeline_uri   TEXT NOT NULL,
+    created_at     TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS buildkite_builds_lookup
+    ON buildkite_builds (knot, pipeline_rkey, workflow);
 `
 
 // migrate applies the schema. Safe to call repeatedly.
