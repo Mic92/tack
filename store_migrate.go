@@ -57,6 +57,27 @@ CREATE TABLE IF NOT EXISTS repo_collaborators (
     created_at TEXT NOT NULL,
     PRIMARY KEY (did, rkey)
 );
+
+-- Outbound event log. Each row is one record we want to fan out to
+-- connected /events websocket subscribers (typically the Tangled
+-- appview) — today only sh.tangled.pipeline.status.
+--
+-- We persist instead of pushing through an in-memory channel so that
+-- (a) a reconnecting subscriber can resume from a cursor without
+--     missing events that happened during the gap, and
+-- (b) slow subscribers can't make us drop events for fast ones — they
+--     simply lag behind in the rowid space.
+--
+-- AUTOINCREMENT (vs plain INTEGER PRIMARY KEY) guarantees rowids
+-- strictly increase and never get reused if a row is ever deleted, so
+-- treating the created column as a monotonic cursor is safe forever.
+CREATE TABLE IF NOT EXISTS events (
+    created     INTEGER PRIMARY KEY AUTOINCREMENT,
+    rkey        TEXT NOT NULL,
+    nsid        TEXT NOT NULL,
+    event_json  TEXT NOT NULL,
+    inserted_at TEXT NOT NULL
+);
 `
 
 // migrate applies the schema. Safe to call repeatedly.

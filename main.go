@@ -108,6 +108,12 @@ func main() {
 	}()
 	logger.Info("store open", "path", cfg.DBPath)
 
+	// In-process broker for the /events fan-out. Wraps the store so
+	// publishes are durable and reconnecting subscribers can resume by
+	// cursor. Constructed before the consumers in case we ever want
+	// them to publish synthetic status events at startup.
+	br := newBroker(st)
+
 	// Start the knot event-stream consumer first so the jetstream
 	// loop has somewhere to register newly-observed knots into.
 	knots, err := startKnotConsumer(ctx, cfg, st)
@@ -127,7 +133,7 @@ func main() {
 
 	// Run the HTTP server. This blocks until ctx is cancelled or the
 	// listener errors.
-	if err := runHTTP(ctx, cfg); err != nil {
+	if err := runHTTP(ctx, cfg, br); err != nil {
 		logger.Error("http server error", "err", err)
 		os.Exit(1)
 	}

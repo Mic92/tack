@@ -21,9 +21,11 @@ package main
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strconv"
+	"time"
 
 	_ "github.com/mattn/go-sqlite3"
 )
@@ -274,4 +276,86 @@ func (s *store) DeleteRepoCollaborator(ctx context.Context, did, rkey string) er
 		return fmt.Errorf("delete repo_collaborator: %w", err)
 	}
 	return nil
+}
+
+// EventRow is one row of the events table. It represents an outbound
+// record we want to deliver to /events websocket subscribers, in the
+// shape callers actually need (raw record JSON, not stringly-typed).
+type EventRow struct {
+	// Created is the assigned monotonic rowid; doubles as the cursor
+	// value subscribers use to resume.
+	Created int64
+	// Rkey is the ATProto record key. For sh.tangled.pipeline.status
+	// records this is the rkey we mint when publishing.
+	Rkey string
+	// Nsid is the lexicon collection (e.g. sh.tangled.pipeline.status).
+	Nsid string
+	// EventJSON is the record body verbatim — held as RawMessage so
+	// the /events handler can splice it into the wire envelope without
+	// an unmarshal/remarshal round-trip.
+	EventJSON json.RawMessage
+}
+
+// InsertEvent appends an event row and returns its assigned `created`
+// (rowid) cursor. Storage is the source of truth for fan-out, so we
+// write here even if zero subscribers are connected — a subscriber that
+// connects later (with an old cursor) will pick the row up via
+// EventsAfter.
+//
+// eventJSON must be a valid JSON object; we store it verbatim. Length
+// validation is intentionally absent — the schema accepts arbitrary
+// TEXT and SQLite handles huge blobs fine for our scale.
+func (s *store) InsertEvent(ctx context.Context, rkey, nsid string, eventJSON []byte) (int64, error) {
+	res, err := s.db.ExecContext(ctx,
+		`INSERT INTO events (rkey, nsid, event_json, inserted_at)
+         VALUES (?, ?, ?, ?)`,
+		rkey, nsid, string(eventJSON),
+		time.Now().UTC().Format(time.RFC3339Nano),
+	)
+	if err != nil {
+		return 0, fmt.Errorf("insert event: %w", err)
+	}
+	id, err := res.LastInsertId()
+	if err != nil {
+		return 0, fmt.Errorf("event last insert id: %w", err)
+	}
+	return id, nil
+}
+
+// EventsAfter returns every event row with `created` strictly greater
+// than cursor, in cursor order. Used by /events to backfill a
+// reconnecting subscriber and to drain newly-published rows on each
+// broker notification.
+//
+// Pass cursor=0 to get the full log from the beginning, which is what
+// happens when a subscriber connects without a ?cursor= query param.
+func (s *store) EventsAfter(ctx context.Context, cursor int64) ([]EventRow, error) {
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT created, rkey, nsid, event_json
+         FROM events
+         WHERE created > ?
+         ORDER BY created ASC`,
+		cursor,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("query events: %w", err)
+	}
+	defer rows.Close()
+
+	out := []EventRow{}
+	for rows.Next() {
+		var (
+			ev  EventRow
+			raw string
+		)
+		if err := rows.Scan(&ev.Created, &ev.Rkey, &ev.Nsid, &raw); err != nil {
+			return nil, fmt.Errorf("scan event: %w", err)
+		}
+		ev.EventJSON = json.RawMessage(raw)
+		out = append(out, ev)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate events: %w", err)
+	}
+	return out, nil
 }
