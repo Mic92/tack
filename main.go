@@ -159,20 +159,23 @@ func main() {
 	// them to publish synthetic status events at startup.
 	br := newBroker(st)
 
-	// Provider that turns Tangled pipeline triggers into
-	// pipeline.status events. The Buildkite provider is the real
-	// integration; the fake one stands in when no Buildkite token is
-	// configured so the full jetstream → knot → /events flow is
-	// still exercisable locally without a Buildkite account.
+	// Providers turn Tangled pipeline triggers into pipeline.status
+	// events. We always wire the fake provider in so workflows can
+	// opt into it (via `tack: { fake: ... }`) for end-to-end testing
+	// even when Buildkite credentials are present; the Buildkite
+	// provider is added on top when configured. Routing is per-
+	// workflow and driven by the workflow YAML — see providerRouter.
 	//
 	// bkProvider is kept as a typed pointer separately because the
 	// /webhooks/buildkite handler needs the concrete *buildkiteProvider
 	// (for HandleWebhook + signature verification), not the abstract
 	// Provider surface.
-	var (
-		provider   Provider
-		bkProvider *buildkiteProvider
-	)
+	providers := map[string]Provider{
+		"fake": newFakeProvider(br, logger),
+	}
+	logger.Info("fake provider enabled (workflow opt-in via `tack.fake:`)")
+
+	var bkProvider *buildkiteProvider
 	if cfg.BuildkiteToken != "" {
 		bkProvider = newBuildkiteProvider(
 			br, st,
@@ -182,15 +185,13 @@ func main() {
 			cfg.BuildkiteWebhookMode,
 			logger,
 		)
-		provider = bkProvider
+		providers["buildkite"] = bkProvider
 		logger.Info("buildkite provider enabled",
 			"default_org", cfg.BuildkiteOrg,
 			"webhook_mode", cfg.BuildkiteWebhookMode,
 		)
-	} else {
-		provider = newFakeProvider(br, logger)
-		logger.Info("fake provider enabled (set TACK_BUILDKITE_TOKEN to use buildkite)")
 	}
+	provider := newProviderRouter(logger, providers)
 
 	// Start the knot event-stream consumer first so the jetstream
 	// loop has somewhere to register newly-observed knots into. It

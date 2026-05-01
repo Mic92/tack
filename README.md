@@ -80,9 +80,10 @@ configuration (e.g. Buildkite) lives in its own section below.
 | `TACK_JETSTREAM_URL` | Tangled Jetstream WebSocket URL                          |
 | `TACK_DEV`           | Use `ws://` for knot event-streams (any non-empty value) |
 
-When no provider is configured, tack runs an in-process fake provider
-that's useful for exercising the jetstream → knot → `/events` flow
-locally without a real CI account.
+All configured providers are active simultaneously. Each workflow
+chooses its provider via the first key under its top-level `tack:`
+block. e.g. `tack: { buildkite: { ... } }` runs on Buildkite,
+`tack: { fake: {} }` runs on the in-process fake provider.
 
 ## Providers
 
