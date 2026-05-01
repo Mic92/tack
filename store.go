@@ -194,6 +194,36 @@ func (s *store) UpsertRepoCollaborator(ctx context.Context, did, rkey, repo, rep
 	return nil
 }
 
+// KnotsForSpindle returns the distinct knot hostnames of all repos that
+// have declared the given spindle hostname as their CI spindle. The knot
+// event-stream subscriber uses this to decide which knots to dial.
+//
+// Returns an empty slice (not nil) when nothing matches, so callers can
+// range over the result without a nil check.
+func (s *store) KnotsForSpindle(ctx context.Context, hostname string) ([]string, error) {
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT DISTINCT knot FROM repos WHERE spindle = ? AND knot <> ''`,
+		hostname,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("query knots: %w", err)
+	}
+	defer rows.Close()
+
+	out := []string{}
+	for rows.Next() {
+		var k string
+		if err := rows.Scan(&k); err != nil {
+			return nil, fmt.Errorf("scan knot: %w", err)
+		}
+		out = append(out, k)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate knots: %w", err)
+	}
+	return out, nil
+}
+
 // DeleteRepoCollaborator removes a collaborator record by its ATProto
 // identity.
 func (s *store) DeleteRepoCollaborator(ctx context.Context, did, rkey string) error {

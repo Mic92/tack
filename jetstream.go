@@ -51,7 +51,7 @@ const (
 //
 // The logger is pulled from ctx (see log.go); falls back to slog.Default()
 // if none is attached.
-func startJetstream(ctx context.Context, cfg config, st *store) error {
+func startJetstream(ctx context.Context, cfg config, st *store, knots KnotConsumer) error {
 	logger := loggerFrom(ctx).With("component", "jetstream")
 
 	// `wantedCollections` is a server-side filter: jetstream will only send
@@ -69,11 +69,12 @@ func startJetstream(ctx context.Context, cfg config, st *store) error {
 	clientCfg.WebsocketURL = cfg.JetstreamURL
 	clientCfg.WantedCollections = collections
 
-	// The handler closes over `st` and `logger` so the scheduler signature
-	// stays plain `func(ctx, *Event) error` — no need for a method
-	// receiver or a global.
+	// The handler closes over `st`, `knots` and the spindle hostname so
+	// the scheduler signature stays plain `func(ctx, *Event) error` and
+	// applyCommit can hand the knot consumer new sources as soon as
+	// matching repo records arrive.
 	handler := func(ctx context.Context, evt *jsmodels.Event) error {
-		return handleJetstreamEvent(ctx, st, evt)
+		return handleJetstreamEvent(ctx, st, knots, cfg.Hostname, evt)
 	}
 
 	// Re-attach the component-scoped logger so handler — which the
@@ -136,7 +137,7 @@ func startJetstream(ctx context.Context, cfg config, st *store) error {
 // applies the event to the store and advances the persisted cursor. Any
 // returned error is logged by the scheduler but does not tear down the
 // connection — the next event will retry the cursor write implicitly.
-func handleJetstreamEvent(ctx context.Context, st *store, evt *jsmodels.Event) error {
+func handleJetstreamEvent(ctx context.Context, st *store, knots KnotConsumer, hostname string, evt *jsmodels.Event) error {
 	// We only care about commits, which are the actual record CRUD
 	// operations on a user's PDS. Account/identity events are ignored
 	// for now; if we ever care about handle changes we can add them.
@@ -148,7 +149,7 @@ func handleJetstreamEvent(ctx context.Context, st *store, evt *jsmodels.Event) e
 	// Dispatch on collection. Unknown collections shouldn't happen given
 	// our wantedCollections filter, but be defensive — jetstream may
 	// send schema changes ahead of us updating the filter.
-	if err := applyCommit(ctx, st, evt); err != nil {
+	if err := applyCommit(ctx, st, knots, hostname, evt); err != nil {
 		logger.Error("apply commit",
 			"err", err,
 			"did", evt.Did,
@@ -175,13 +176,13 @@ func handleJetstreamEvent(ctx context.Context, st *store, evt *jsmodels.Event) e
 
 // applyCommit routes a commit to the right store mutation based on its
 // collection NSID and operation.
-func applyCommit(ctx context.Context, st *store, evt *jsmodels.Event) error {
+func applyCommit(ctx context.Context, st *store, knots KnotConsumer, hostname string, evt *jsmodels.Event) error {
 	c := evt.Commit
 	switch c.Collection {
 	case tangled.SpindleMemberNSID:
 		return applySpindleMember(ctx, st, evt.Did, c)
 	case tangled.RepoNSID:
-		return applyRepo(ctx, st, evt.Did, c)
+		return applyRepo(ctx, st, knots, hostname, evt.Did, c)
 	case tangled.RepoCollaboratorNSID:
 		return applyRepoCollaborator(ctx, st, evt.Did, c)
 	default:
@@ -207,19 +208,35 @@ func applySpindleMember(ctx context.Context, st *store, did string, c *jsmodels.
 	return nil
 }
 
-func applyRepo(ctx context.Context, st *store, did string, c *jsmodels.Commit) error {
+func applyRepo(ctx context.Context, st *store, knots KnotConsumer, hostname string, did string, c *jsmodels.Commit) error {
 	switch c.Operation {
 	case jsOpCreate, jsOpUpdate:
 		var rec tangled.Repo
 		if err := json.Unmarshal(c.Record, &rec); err != nil {
 			return fmt.Errorf("decode repo: %w", err)
 		}
-		return st.UpsertRepo(ctx, did, c.RKey,
+		if err := st.UpsertRepo(ctx, did, c.RKey,
 			rec.Knot, rec.Name,
 			deref(rec.Spindle), deref(rec.RepoDid),
 			rec.CreatedAt,
-		)
+		); err != nil {
+			return err
+		}
+
+		// If this repo just declared us as its spindle, start (or
+		// continue) listening to its knot for pipeline triggers. The
+		// knot consumer dedupes on its own so this is safe to call
+		// even on update events that don't change the spindle field.
+		if knots != nil && rec.Spindle != nil && *rec.Spindle == hostname && rec.Knot != "" {
+			knots.AddKnot(ctx, rec.Knot)
+		}
+
+		return nil
 	case jsOpDelete:
+		// We don't unsubscribe from the knot here: other repos may
+		// still want us to watch it. A periodic reconciliation pass
+		// (not yet implemented) is the right place to drop unused
+		// subscriptions.
 		return st.DeleteRepo(ctx, did, c.RKey)
 	}
 	return nil

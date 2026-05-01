@@ -239,6 +239,51 @@ func TestRepoCollaboratorLifecycle(t *testing.T) {
 	}
 }
 
+// TestKnotsForSpindle verifies the query returns only knots from repos
+// whose .spindle field matches the given hostname, and that duplicate
+// knots collapse to a single entry.
+func TestKnotsForSpindle(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+
+	const ours = "tack.example"
+	const other = "other.example"
+
+	// Two repos on the same knot pointing at us — should collapse to 1.
+	if err := s.UpsertRepo(ctx, "did:plc:a", "rk1", "knot1.example", "repo-a", ours, "", "t"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.UpsertRepo(ctx, "did:plc:b", "rk2", "knot1.example", "repo-b", ours, "", "t"); err != nil {
+		t.Fatal(err)
+	}
+	// A second knot pointing at us.
+	if err := s.UpsertRepo(ctx, "did:plc:c", "rk3", "knot2.example", "repo-c", ours, "", "t"); err != nil {
+		t.Fatal(err)
+	}
+	// A repo pointing at a different spindle — must be excluded.
+	if err := s.UpsertRepo(ctx, "did:plc:d", "rk4", "knot3.example", "repo-d", other, "", "t"); err != nil {
+		t.Fatal(err)
+	}
+	// A repo with no spindle declared — must be excluded.
+	if err := s.UpsertRepo(ctx, "did:plc:e", "rk5", "knot4.example", "repo-e", "", "", "t"); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := s.KnotsForSpindle(ctx, ours)
+	if err != nil {
+		t.Fatalf("KnotsForSpindle: %v", err)
+	}
+	want := map[string]struct{}{"knot1.example": {}, "knot2.example": {}}
+	if len(got) != len(want) {
+		t.Fatalf("got %v, want %v", got, want)
+	}
+	for _, k := range got {
+		if _, ok := want[k]; !ok {
+			t.Fatalf("unexpected knot %q in %v", k, got)
+		}
+	}
+}
+
 // countRows is a small SELECT COUNT(*) helper used by lifecycle tests
 // to verify deletes actually removed the row. Table name is interpolated
 // directly because callers pass a constant from the schema, not user

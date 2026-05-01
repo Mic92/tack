@@ -21,17 +21,23 @@ import (
 // spindle without surprises.
 type config struct {
 	Addr         string
+	Hostname     string
 	OwnerDID     string
 	JetstreamURL string
 	DBPath       string
+	// Dev flips the knot event-stream scheme from wss:// to ws://.
+	// Useful when running against a local knot during development.
+	Dev bool
 }
 
 func loadConfig() (config, error) {
 	cfg := config{
 		Addr:         envOr("TACK_LISTEN_ADDR", ":8080"),
+		Hostname:     os.Getenv("TACK_HOSTNAME"),
 		OwnerDID:     os.Getenv("TACK_OWNER_DID"),
 		JetstreamURL: envOr("TACK_JETSTREAM_URL", "wss://jetstream1.us-west.bsky.network/subscribe"),
 		DBPath:       envOr("TACK_DB_PATH", "tack.db"),
+		Dev:          os.Getenv("TACK_DEV") != "",
 	}
 	addrFlag := flag.String("addr", cfg.Addr, "HTTP listen address (overrides TACK_LISTEN_ADDR)")
 	flag.Parse()
@@ -40,6 +46,16 @@ func loadConfig() (config, error) {
 	if cfg.OwnerDID == "" {
 		return cfg, errors.New("TACK_OWNER_DID is required")
 	}
+
+	// Hostname identifies *us* in sh.tangled.repo records (the .spindle
+	// field). Without it we have no way to know which repos point at us
+	// and therefore which knots we should subscribe to for pipeline
+	// triggers — so we refuse to start rather than silently subscribe to
+	// nothing.
+	if cfg.Hostname == "" {
+		return cfg, errors.New("TACK_HOSTNAME is required")
+	}
+
 	return cfg, nil
 }
 
@@ -92,8 +108,19 @@ func main() {
 	}()
 	logger.Info("store open", "path", cfg.DBPath)
 
-	// Start the JetStream listener in the background.
-	if err := startJetstream(ctx, cfg, st); err != nil {
+	// Start the knot event-stream consumer first so the jetstream
+	// loop has somewhere to register newly-observed knots into.
+	knots, err := startKnotConsumer(ctx, cfg, st)
+	if err != nil {
+		logger.Error("failed to start knot consumer", "err", err)
+		os.Exit(1)
+	}
+	defer knots.Stop()
+
+	// Start the JetStream listener in the background. It hands the knot
+	// consumer any new knot referenced by an incoming sh.tangled.repo
+	// record so we don't have to wait for a restart to pick it up.
+	if err := startJetstream(ctx, cfg, st, knots); err != nil {
 		logger.Error("failed to start jetstream consumer", "err", err)
 		os.Exit(1)
 	}

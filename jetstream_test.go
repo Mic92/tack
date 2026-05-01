@@ -66,7 +66,7 @@ func TestHandleNonCommitEvent(t *testing.T) {
 		TimeUS: 100,
 		Kind:   jsmodels.EventKindAccount,
 	}
-	if err := handleJetstreamEvent(ctx, s, evt); err != nil {
+	if err := handleJetstreamEvent(ctx, s, nil, "", evt); err != nil {
 		t.Fatalf("handle: %v", err)
 	}
 	got, err := s.LoadCursor(ctx)
@@ -90,7 +90,7 @@ func TestHandleSpindleMemberCreate(t *testing.T) {
 		CreatedAt: "2026-01-01T00:00:00Z",
 	}
 	evt := commitEvent(12345, "did:plc:owner", tangled.SpindleMemberNSID, jsOpCreate, "rk1", rec)
-	if err := handleJetstreamEvent(ctx, s, evt); err != nil {
+	if err := handleJetstreamEvent(ctx, s, nil, "", evt); err != nil {
 		t.Fatalf("handle: %v", err)
 	}
 
@@ -118,7 +118,7 @@ func TestHandleSpindleMemberDelete(t *testing.T) {
 		t.Fatalf("seed: %v", err)
 	}
 	evt := commitEvent(99, "did:plc:owner", tangled.SpindleMemberNSID, jsOpDelete, "rk1", nil)
-	if err := handleJetstreamEvent(ctx, s, evt); err != nil {
+	if err := handleJetstreamEvent(ctx, s, nil, "", evt); err != nil {
 		t.Fatalf("handle: %v", err)
 	}
 	if n := countRows(t, s, "spindle_members"); n != 0 {
@@ -144,7 +144,7 @@ func TestHandleRepoCreateOptionals(t *testing.T) {
 		CreatedAt: "2026-01-01T00:00:00Z",
 	}
 	evt := commitEvent(7, "did:plc:owner", tangled.RepoNSID, jsOpCreate, "repo1", rec)
-	if err := handleJetstreamEvent(ctx, s, evt); err != nil {
+	if err := handleJetstreamEvent(ctx, s, nil, "", evt); err != nil {
 		t.Fatalf("handle: %v", err)
 	}
 
@@ -168,7 +168,7 @@ func TestHandleRepoCreateOptionals(t *testing.T) {
 		CreatedAt: "2026-01-01T00:00:00Z",
 	}
 	evt2 := commitEvent(8, "did:plc:owner", tangled.RepoNSID, jsOpCreate, "repo2", rec2)
-	if err := handleJetstreamEvent(ctx, s, evt2); err != nil {
+	if err := handleJetstreamEvent(ctx, s, nil, "", evt2); err != nil {
 		t.Fatalf("handle nil-optionals: %v", err)
 	}
 	err = s.db.QueryRowContext(ctx,
@@ -197,7 +197,7 @@ func TestHandleRepoCollaboratorCreate(t *testing.T) {
 		CreatedAt: "2026-01-01T00:00:00Z",
 	}
 	evt := commitEvent(55, "did:plc:owner", tangled.RepoCollaboratorNSID, jsOpCreate, "c1", rec)
-	if err := handleJetstreamEvent(ctx, s, evt); err != nil {
+	if err := handleJetstreamEvent(ctx, s, nil, "", evt); err != nil {
 		t.Fatalf("handle: %v", err)
 	}
 
@@ -223,7 +223,7 @@ func TestHandleUnknownCollection(t *testing.T) {
 	ctx := context.Background()
 
 	evt := commitEvent(42, "did:plc:owner", "app.bsky.feed.post", jsOpCreate, "rk", map[string]string{"text": "hi"})
-	if err := handleJetstreamEvent(ctx, s, evt); err != nil {
+	if err := handleJetstreamEvent(ctx, s, nil, "", evt); err != nil {
 		t.Fatalf("handle: %v", err)
 	}
 	requireCursor(t, s, 42)
@@ -248,11 +248,65 @@ func TestHandleBadRecordAdvancesCursor(t *testing.T) {
 			Record:     json.RawMessage(`{not valid json`),
 		},
 	}
-	if err := handleJetstreamEvent(ctx, s, evt); err != nil {
+	if err := handleJetstreamEvent(ctx, s, nil, "", evt); err != nil {
 		t.Fatalf("handle should swallow decode error, got: %v", err)
 	}
 	if n := countRows(t, s, "spindle_members"); n != 0 {
 		t.Fatalf("bad record should not have inserted; got %d rows", n)
 	}
 	requireCursor(t, s, 1000)
+}
+
+// TestRepoEventSubscribesKnotForOurSpindle confirms that observing a
+// sh.tangled.repo whose .spindle field equals our hostname results in a
+// dynamic AddKnot call. This is the hot path for picking up new repos
+// without a tack restart.
+func TestRepoEventSubscribesKnotForOurSpindle(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+
+	const ours = "tack.example"
+	spindle := ours
+	rec := tangled.Repo{
+		Knot:      "knot.example",
+		Name:      "myrepo",
+		Spindle:   &spindle,
+		CreatedAt: "2026-01-01T00:00:00Z",
+	}
+	evt := commitEvent(1, "did:plc:owner", tangled.RepoNSID, jsOpCreate, "rk", rec)
+
+	fake := &fakeKnotConsumer{}
+	if err := handleJetstreamEvent(ctx, s, fake, ours, evt); err != nil {
+		t.Fatalf("handle: %v", err)
+	}
+	added := fake.Added()
+	if len(added) != 1 || added[0] != "knot.example" {
+		t.Fatalf("AddKnot calls = %v, want [knot.example]", added)
+	}
+}
+
+// TestRepoEventIgnoresKnotForOtherSpindle confirms repos pointing at a
+// *different* spindle do not pull us into watching their knot. Without
+// this guard, tack would dial every knot named in any sh.tangled.repo
+// it sees over the firehose, which is most of them.
+func TestRepoEventIgnoresKnotForOtherSpindle(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+
+	other := "other-spindle.example"
+	rec := tangled.Repo{
+		Knot:      "knot.example",
+		Name:      "myrepo",
+		Spindle:   &other,
+		CreatedAt: "2026-01-01T00:00:00Z",
+	}
+	evt := commitEvent(1, "did:plc:owner", tangled.RepoNSID, jsOpCreate, "rk", rec)
+
+	fake := &fakeKnotConsumer{}
+	if err := handleJetstreamEvent(ctx, s, fake, "tack.example", evt); err != nil {
+		t.Fatalf("handle: %v", err)
+	}
+	if added := fake.Added(); len(added) != 0 {
+		t.Fatalf("AddKnot calls = %v, want none", added)
+	}
 }
