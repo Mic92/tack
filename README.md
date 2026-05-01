@@ -55,10 +55,6 @@ status, counts, etc. can show up inline in things like pull requests.
                                                   sh.tangled.pipeline.status
 ```
 
-```sh
-go run . -addr :8080
-```
-
 ## Configuration
 
 Core configuration controls how tack talks to Tangled. Provider-specific
