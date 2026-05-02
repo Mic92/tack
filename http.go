@@ -84,11 +84,36 @@ func runHTTP(ctx context.Context, cfg config, br *broker, provider Provider, bkP
 	return srv.Shutdown(shutdownCtx)
 }
 
-// rootHandler responds at "/" with a small identifier. Mainly useful as a
-// liveness check during deployment.
+// rootHandler responds at "/" with a friendly identifier page. Mainly
+// useful as a liveness check during deployment, and as a calling card
+// for the curious operator who hits the root in a browser.
 func rootHandler() http.HandlerFunc {
+	// Plain-text banner. "tack" rendered in figlet's larry3d font; the
+	// shape mirrors the style the bluesky PDS serves at its own root,
+	// which feels like the right vibe for an atproto-adjacent service.
+	const banner = ` __                    __
+/\ \__                /\ \
+\ \ ,_\    __      ___\ \ \/'\
+ \ \ \/  /'__'\   /'___\ \ , <
+  \ \ \_/\ \L\.\_/\ \__/\ \ \\'\
+   \ \__\ \__/.\_\ \____\\ \_\ \_\
+    \/__/\/__/\/_/\/____/ \/_/\/_/
+
+
+This is a tack server: a tangled spindle for other CI services.
+
+      Code: https://github.com/mitchellh/tack
+`
 	return func(w http.ResponseWriter, r *http.Request) {
-		fmt.Fprintln(w, "tack: a Tangled spindle backed by Buildkite")
+		// Only respond at exactly "/" — without this guard, the
+		// "GET /" pattern would also catch arbitrary unmatched
+		// paths like "/foo" and lie about being the root.
+		if r.URL.Path != "/" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		fmt.Fprint(w, banner)
 	}
 }
 
