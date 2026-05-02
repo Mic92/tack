@@ -505,3 +505,87 @@ func TestTriggerCommitAndBranch(t *testing.T) {
 		})
 	}
 }
+
+// TestStripTerminal exercises both shapes of Buildkite's inline
+// timestamp metadata: the well-formed APC envelope ESC _ … BEL, and
+// the bare "_bk;t=<digits>" residue we sometimes see when an upstream
+// processor strips control bytes without understanding the envelope.
+func TestStripTerminal(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{"empty", "", ""},
+		{"no metadata", "hello world\n", "hello world\n"},
+		{
+			"framed apc",
+			"\x1b_bk;t=1777680702553\x07~~~ Running agent environment hook\n",
+			"~~~ Running agent environment hook\n",
+		},
+		{
+			"multiple framed apc per line",
+			"\x1b_bk;t=1\x07a\x1b_bk;t=2\x07b\n",
+			"ab\n",
+		},
+		{
+			"bare residue",
+			"_bk;t=1777680702553~~~ Running agent environment hook\n",
+			"~~~ Running agent environment hook\n",
+		},
+		{
+			"bare residue mid-line",
+			"remote: Counting objects: 0% _bk;t=1777680705851\n",
+			"remote: Counting objects: 0% \n",
+		},
+		{
+			"unterminated apc dropped",
+			"keep\x1b_bk;t=1no-bel-here",
+			"keep",
+		},
+		{
+			// Underscores unrelated to bk;t= must survive untouched.
+			"underscore not metadata",
+			"foo_bar baz_qux\n",
+			"foo_bar baz_qux\n",
+		},
+		{
+			// CSI colour codes are stripped down to plain text.
+			"strips csi colour",
+			"\x1b[90m# comment\x1b[0m\n",
+			"# comment\n",
+		},
+		{
+			// Clear-to-EOL embedded mid-line is removed too.
+			"strips csi clear-to-eol",
+			"remote: Counting objects: 1% (2/144) \x1b[K\n",
+			"remote: Counting objects: 1% (2/144) \n",
+		},
+		{
+			// OSC title-set sequences (terminated by BEL) drop.
+			"strips osc bel terminated",
+			"before\x1b]0;window title\x07after\n",
+			"beforeafter\n",
+		},
+		{
+			// OSC terminated by ST (ESC '\') also drops.
+			"strips osc st terminated",
+			"before\x1b]0;title\x1b\\after\n",
+			"beforeafter\n",
+		},
+		{
+			// Two-byte escapes like ESC '=' (DECKPAM) drop.
+			"strips two byte escape",
+			"a\x1b=b\n",
+			"ab\n",
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := stripTerminal(c.in)
+			if got != c.want {
+				t.Fatalf("got %q; want %q", got, c.want)
+			}
+		})
+	}
+}

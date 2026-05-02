@@ -434,6 +434,14 @@ func (p *buildkiteProvider) Logs(
 				body = ""
 			}
 
+			// Buildkite injects per-line timestamp metadata as
+			// ANSI APC sequences (ESC "_" "bk;t=<ms>" BEL) and
+			// some renderers downstream don't recognise the APC
+			// envelope, leaking the inner "_bk;t=…" payload into
+			// the displayed text. Strip them here so consumers
+			// only ever see the actual log content.
+			body = stripTerminal(body)
+
 			for _, line := range strings.Split(strings.TrimRight(body, "\n"), "\n") {
 				if line == "" {
 					// Skip the leading empty entry that
@@ -651,6 +659,95 @@ func refToBranch(ref string) string {
 		return strings.TrimPrefix(ref, prefix)
 	}
 	return ref
+}
+
+// stripTerminal removes ANSI/ECMA-48 escape sequences from a log
+// payload, leaving only the displayable text. We need this because
+// Buildkite ships its plain-text log API with the agent's full
+// terminal output — per-line timestamp APC envelopes
+// (`ESC _ "bk;t=<unix-ms>" BEL`), CSI colour codes, clear-to-EOL
+// (`ESC [ K`), OSC title sets, etc. — and our consumers are not
+// terminal emulators; they render the bytes verbatim.
+//
+// We recognise the standard escape families described by ECMA-48:
+//
+//   - CSI:        ESC '['  parameters intermediates final
+//   - OSC/DCS/APC/SOS/PM: ESC (']'|'P'|'_'|'X'|'^') … (BEL | ESC '\')
+//   - everything else: ESC <single byte>
+//
+// As a safety belt we also strip the bare "_bk;t=<digits>" residue
+// that appears when an upstream processor has stripped the ESC/BEL
+// framing without understanding the APC envelope inside it.
+//
+// We should use libghostty for obvious reasons.
+func stripTerminal(s string) string {
+	if !strings.ContainsAny(s, "\x1b_") {
+		return s
+	}
+	var b strings.Builder
+	b.Grow(len(s))
+	for i := 0; i < len(s); {
+		if s[i] == 0x1b && i+1 < len(s) {
+			switch s[i+1] {
+			case '[':
+				// CSI: parameter bytes 0x30-0x3F, then
+				// intermediate bytes 0x20-0x2F, then a
+				// single final byte 0x40-0x7E. Anything
+				// that doesn't conform we drop minimally
+				// (just the ESC) so we don't swallow
+				// legitimate text.
+				j := i + 2
+				for j < len(s) && s[j] >= 0x30 && s[j] <= 0x3F {
+					j++
+				}
+				for j < len(s) && s[j] >= 0x20 && s[j] <= 0x2F {
+					j++
+				}
+				if j < len(s) && s[j] >= 0x40 && s[j] <= 0x7E {
+					i = j + 1
+					continue
+				}
+				i += 2
+				continue
+			case ']', 'P', '_', 'X', '^':
+				// OSC/DCS/APC/SOS/PM: terminated by BEL or
+				// ST (ESC '\'). Drop the entire envelope.
+				j := i + 2
+				for j < len(s) {
+					if s[j] == 0x07 {
+						j++
+						break
+					}
+					if s[j] == 0x1b && j+1 < len(s) && s[j+1] == '\\' {
+						j += 2
+						break
+					}
+					j++
+				}
+				i = j
+				continue
+			default:
+				// Two-byte escape (RIS, DECSC, charset
+				// selection, …). Drop both bytes.
+				i += 2
+				continue
+			}
+		}
+		// Bare residue: "_bk;t=<digits>" with no ESC/BEL framing.
+		if s[i] == '_' && strings.HasPrefix(s[i:], "_bk;t=") {
+			j := i + len("_bk;t=")
+			for j < len(s) && s[j] >= '0' && s[j] <= '9' {
+				j++
+			}
+			if j > i+len("_bk;t=") {
+				i = j
+				continue
+			}
+		}
+		b.WriteByte(s[i])
+		i++
+	}
+	return b.String()
 }
 
 // sendLine pushes one LogLine into out, returning false if ctx
