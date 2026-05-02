@@ -20,6 +20,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 
@@ -159,9 +160,23 @@ func startJetstream(ctx context.Context, cfg config, st *store, knots KnotConsum
 }
 
 // handleJetstreamEvent is the per-event callback for the JetStream. It
-// applies the event to the store and advances the persisted cursor. Any
-// returned error is logged by the scheduler but does not tear down the
-// connection — the next event will retry the cursor write implicitly.
+// applies the event to the store and, when appropriate, advances the
+// persisted cursor. Any returned error is logged by the scheduler but
+// does not tear down the connection.
+//
+// Cursor-advancement policy:
+//
+//   - Apply succeeded: advance the cursor.
+//   - Apply failed with a badRecordError (malformed record / unusable
+//     input): advance anyway, since replaying a permanently-broken
+//     event on every reconnect would stall the firehose forever.
+//   - Apply failed with anything else (treated as transient: store
+//     hiccup, SQLite busy, disk full, shutdown race, ...): do NOT
+//     advance. Saving the cursor here would permanently skip the
+//     record, which for membership/repo state means we'd silently
+//     lose a row that the rest of tack relies on. Leaving the cursor
+//     in place gives the next reconnect (which rewinds by
+//     jetstreamRewind) a chance to re-deliver and re-apply it.
 func handleJetstreamEvent(ctx context.Context, st *store, knots KnotConsumer, hostname string, evt *jsmodels.Event) error {
 	// We only care about commits, which are the actual record CRUD
 	// operations on a user's PDS. Account/identity events are ignored
@@ -174,18 +189,27 @@ func handleJetstreamEvent(ctx context.Context, st *store, knots KnotConsumer, ho
 	// Dispatch on collection. Unknown collections shouldn't happen given
 	// our wantedCollections filter, but be defensive — jetstream may
 	// send schema changes ahead of us updating the filter.
-	if err := applyCommit(ctx, st, knots, hostname, evt); err != nil {
+	applyErr := applyCommit(ctx, st, knots, hostname, evt)
+	if applyErr != nil {
 		logger.Error("apply commit",
-			"err", err,
+			"err", applyErr,
 			"did", evt.Did,
 			"collection", evt.Commit.Collection,
 			"op", evt.Commit.Operation,
 			"rkey", evt.Commit.RKey,
+			"transient", !isBadRecord(applyErr),
 		)
 
-		// Fall through to cursor save: a single bad record shouldn't
-		// stall the cursor forever and force us to re-process every
-		// subsequent event after a restart.
+		// Transient failure: bail without advancing the cursor so the
+		// next delivery can retry this event. Returning the error
+		// surfaces it in the scheduler's logs too.
+		if !isBadRecord(applyErr) {
+			return applyErr
+		}
+		// Otherwise (badRecordError) fall through to cursor save: a
+		// single bad record shouldn't stall the cursor forever and
+		// force us to re-process every subsequent event after a
+		// restart.
 	}
 
 	// Advance the cursor. TimeUS is the jetstream-assigned microsecond
@@ -197,6 +221,42 @@ func handleJetstreamEvent(ctx context.Context, st *store, knots KnotConsumer, ho
 	}
 
 	return nil
+}
+
+// badRecordError marks an applyCommit failure as caused by the *record
+// itself* being permanently unusable, e.g. a malformed JSON body, or a
+// field that violates an invariant we can't recover from on retry.
+//
+// We need this distinction because the jetstream cursor is time-based
+// and once advanced past an event we will never see it again. So:
+//
+//   - Permanent bad-input failures should still advance the cursor:
+//     replaying the same broken record on every restart accomplishes
+//     nothing and would stall progress on every later event behind it.
+//   - Transient infrastructure failures (SQLite busy, disk full, store
+//     closed mid-shutdown, etc.) must NOT advance the cursor: the
+//     record is fine and the next attempt, on reconnect or after the
+//     transient condition clears, should reapply it. Skipping past
+//     such a failure can permanently lose membership/repo state.
+//
+// Anything returned from applyCommit that isn't a badRecordError is
+// treated as transient by handleJetstreamEvent.
+type badRecordError struct{ err error }
+
+func (e *badRecordError) Error() string { return e.err.Error() }
+func (e *badRecordError) Unwrap() error { return e.err }
+
+// badRecord wraps err so handleJetstreamEvent recognizes it as a
+// permanent, cursor-advancing failure. Use this for any error caused by
+// the contents of the record (decode errors, schema violations); never
+// for store/IO errors.
+func badRecord(err error) error { return &badRecordError{err: err} }
+
+// isBadRecord reports whether err (or anything it wraps) is a
+// badRecordError.
+func isBadRecord(err error) bool {
+	var b *badRecordError
+	return errors.As(err, &b)
 }
 
 // applyCommit routes a commit to the right store mutation based on its
@@ -224,7 +284,9 @@ func applySpindleMember(ctx context.Context, st *store, did string, c *jsmodels.
 	case jsOpCreate, jsOpUpdate:
 		var rec tangled.SpindleMember
 		if err := json.Unmarshal(c.Record, &rec); err != nil {
-			return fmt.Errorf("decode spindle.member: %w", err)
+			// Decode failures are a permanent property of the record's
+			// bytes; mark as bad so the cursor can advance past it.
+			return badRecord(fmt.Errorf("decode spindle.member: %w", err))
 		}
 		return st.UpsertSpindleMember(ctx, did, c.RKey, rec.Instance, rec.Subject, rec.CreatedAt)
 	case jsOpDelete:
@@ -238,7 +300,8 @@ func applyRepo(ctx context.Context, st *store, knots KnotConsumer, hostname stri
 	case jsOpCreate, jsOpUpdate:
 		var rec tangled.Repo
 		if err := json.Unmarshal(c.Record, &rec); err != nil {
-			return fmt.Errorf("decode repo: %w", err)
+			// See applySpindleMember: decode errors are permanent.
+			return badRecord(fmt.Errorf("decode repo: %w", err))
 		}
 
 		// Capture the prior (knot, spindle) before the upsert so the
@@ -340,7 +403,8 @@ func applyRepoCollaborator(ctx context.Context, st *store, did string, c *jsmode
 	case jsOpCreate, jsOpUpdate:
 		var rec tangled.RepoCollaborator
 		if err := json.Unmarshal(c.Record, &rec); err != nil {
-			return fmt.Errorf("decode repo.collaborator: %w", err)
+			// See applySpindleMember: decode errors are permanent.
+			return badRecord(fmt.Errorf("decode repo.collaborator: %w", err))
 		}
 		return st.UpsertRepoCollaborator(ctx, did, c.RKey,
 			deref(rec.Repo), deref(rec.RepoDid),

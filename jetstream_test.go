@@ -10,6 +10,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"path/filepath"
 	"testing"
 
 	jsmodels "github.com/bluesky-social/jetstream/pkg/models"
@@ -255,6 +256,63 @@ func TestHandleBadRecordAdvancesCursor(t *testing.T) {
 		t.Fatalf("bad record should not have inserted; got %d rows", n)
 	}
 	requireCursor(t, s, 1000)
+}
+
+// TestHandleTransientStoreErrorDoesNotAdvanceCursor is the partner to
+// TestHandleBadRecordAdvancesCursor: the cursor must hold its previous
+// position when applyCommit fails for an *infrastructure* reason
+// (here: store closed mid-flight, simulating SQLite busy / shutdown
+// races). Saving the cursor through such a failure would permanently
+// skip a perfectly good record and silently lose membership state.
+func TestHandleTransientStoreErrorDoesNotAdvanceCursor(t *testing.T) {
+	// Build the store inline (not via newTestStore) so the cleanup
+	// tolerates the explicit Close we do below to provoke errors.
+	path := filepath.Join(t.TempDir(), "tack.db")
+	s, err := openStore(path)
+	if err != nil {
+		t.Fatalf("openStore: %v", err)
+	}
+	ctx := context.Background()
+
+	// Seed a baseline cursor; after the failed apply it must still be
+	// 500, not 1000.
+	if err := s.SaveCursor(ctx, 500); err != nil {
+		t.Fatalf("seed cursor: %v", err)
+	}
+
+	// Close the underlying DB. Subsequent store calls will fail with
+	// "sql: database is closed", which is a transient-style error from
+	// applyCommit's perspective: the record itself is well-formed.
+	if err := s.db.Close(); err != nil {
+		t.Fatalf("close db: %v", err)
+	}
+
+	rec := tangled.SpindleMember{
+		Instance:  "https://spindle.example",
+		Subject:   "did:plc:alice",
+		CreatedAt: "2026-01-01T00:00:00Z",
+	}
+	evt := commitEvent(1000, "did:plc:owner", tangled.SpindleMemberNSID, jsOpCreate, "rk", rec)
+
+	// Expect a non-nil error: handler propagates transient failures.
+	if err := handleJetstreamEvent(ctx, s, nil, "", evt); err == nil {
+		t.Fatalf("handle should return transient error, got nil")
+	}
+
+	// Re-open the same DB file to inspect the persisted cursor; the
+	// closed handle obviously can't answer queries.
+	s2, err := openStore(path)
+	if err != nil {
+		t.Fatalf("re-open: %v", err)
+	}
+	defer s2.Close()
+	got, err := s2.LoadCursor(ctx)
+	if err != nil {
+		t.Fatalf("load cursor: %v", err)
+	}
+	if got == nil || *got != 500 {
+		t.Fatalf("cursor = %v, want 500 (must NOT advance on transient error)", got)
+	}
 }
 
 // TestRepoEventSubscribesKnotForOurSpindle confirms that observing a
