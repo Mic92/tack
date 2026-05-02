@@ -288,15 +288,28 @@ const (
 	WebhookModeSignature WebhookMode = "signature"
 )
 
+// MaxSignatureAge bounds how far the signed timestamp may be from
+// the local clock before VerifySignature rejects the request as
+// stale (or implausibly future-dated). Without this, an attacker who
+// captures one valid signed delivery can replay it indefinitely,
+// generating duplicate status events and unbounded growth in the
+// events table. Five minutes matches Buildkite's own published
+// guidance for verifying their signatures and is the same window
+// Stripe et al. use; it absorbs realistic clock skew while keeping
+// the replay surface tight.
+const MaxSignatureAge = 5 * time.Minute
+
+// timeNow is the clock VerifySignature consults for freshness. A
+// package-level var so tests can pin "now" deterministically without
+// touching the system clock or threading a clock argument through
+// every caller.
+var timeNow = time.Now
+
 // VerifySignature validates the X-Buildkite-Signature header against
 // secret using the documented "<timestamp>.<body>" HMAC-SHA256
-// scheme. Returns nil when the header is well-formed and the digest
-// matches; any other condition returns an error.
-//
-// We deliberately do NOT enforce a freshness window on timestamp:
-// callers in practice consume idempotent or storage-deduplicated
-// events, so a replayed event is at worst a duplicate publish.
-// Callers that need stricter freshness should layer it on top.
+// scheme. Returns nil when the header is well-formed, the digest
+// matches, and the signed timestamp is within MaxSignatureAge of
+// now; any other condition returns an error.
 //
 // The header format is "timestamp=<unix>,signature=<hex>".
 func VerifySignature(header, secret string, body []byte) error {
@@ -325,11 +338,21 @@ func VerifySignature(header, secret string, body []byte) error {
 	if ts == "" || sig == "" {
 		return errors.New("malformed signature header")
 	}
-	// Sanity-check the timestamp is a parseable int. The value
-	// itself isn't validated against the clock (see comment above),
-	// but a non-numeric timestamp is structurally invalid.
-	if _, err := strconv.ParseInt(ts, 10, 64); err != nil {
+	tsInt, err := strconv.ParseInt(ts, 10, 64)
+	if err != nil {
 		return fmt.Errorf("invalid timestamp: %w", err)
+	}
+	// Freshness check: reject signatures whose timestamp is more
+	// than MaxSignatureAge away from now in either direction. The
+	// symmetric bound also rejects implausibly future-dated stamps,
+	// which would otherwise let an attacker mint a replay window
+	// well into the future.
+	skew := timeNow().Sub(time.Unix(tsInt, 0))
+	if skew < 0 {
+		skew = -skew
+	}
+	if skew > MaxSignatureAge {
+		return fmt.Errorf("signature timestamp outside freshness window (skew %s)", skew)
 	}
 
 	mac := hmac.New(sha256.New, []byte(secret))

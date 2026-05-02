@@ -16,6 +16,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 )
 
 // TestVerifySignature covers the HMAC mode end to end. The reference
@@ -26,11 +27,30 @@ func TestVerifySignature(t *testing.T) {
 	body := []byte(`{"event":"build.finished"}`)
 	const ts = "1700000000"
 
+	// Pin the clock to "now == ts" so the freshness check is
+	// satisfied for the in-window cases and we can dial it past the
+	// max-age boundary for the stale case below.
+	tsTime := time.Unix(1700000000, 0)
+	prevNow := timeNow
+	timeNow = func() time.Time { return tsTime }
+	defer func() { timeNow = prevNow }()
+
 	mac := hmac.New(sha256.New, []byte(secret))
 	mac.Write([]byte(ts))
 	mac.Write([]byte("."))
 	mac.Write(body)
 	good := hex.EncodeToString(mac.Sum(nil))
+
+	// Same body/secret/timestamp, but signed for a moment far in
+	// the past relative to our pinned clock. A correct verifier
+	// must reject it even though the HMAC itself is valid, otherwise
+	// captured deliveries replay forever.
+	const staleTS = "1600000000"
+	staleMac := hmac.New(sha256.New, []byte(secret))
+	staleMac.Write([]byte(staleTS))
+	staleMac.Write([]byte("."))
+	staleMac.Write(body)
+	staleSig := hex.EncodeToString(staleMac.Sum(nil))
 
 	cases := []struct {
 		name    string
@@ -48,6 +68,7 @@ func TestVerifySignature(t *testing.T) {
 		{"non-numeric timestamp", "timestamp=abc,signature=" + good, secret, body, true},
 		{"wrong signature", "timestamp=" + ts + ",signature=00", secret, body, true},
 		{"wrong body", "timestamp=" + ts + ",signature=" + good, secret, []byte("nope"), true},
+		{"stale timestamp", "timestamp=" + staleTS + ",signature=" + staleSig, secret, body, true},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
