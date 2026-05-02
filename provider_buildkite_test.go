@@ -253,6 +253,99 @@ func TestBuildkiteSpawnWorkflowConfig(t *testing.T) {
 	}
 }
 
+// TestBuildkiteSpawnPersistsResolvedOrg pins that Spawn writes the
+// *resolved* org to the buildkite_builds row when the workflow YAML
+// omits `tack.buildkite.org`. Storing cfg.Org (empty) here would let
+// historical lookups silently follow a later change to defaultOrg
+// into the wrong organisation; storing the value we actually issued
+// the CreateBuild against keeps each row self-describing.
+func TestBuildkiteSpawnPersistsResolvedOrg(t *testing.T) {
+	bk := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// The default org in newBuildkiteTestProvider is "myorg";
+		// the URL must reflect the resolved fallback so we know
+		// what value the row is expected to capture.
+		if !strings.Contains(r.URL.Path, "/organizations/myorg/") {
+			t.Errorf("CreateBuild path = %q; want /organizations/myorg/", r.URL.Path)
+		}
+		w.WriteHeader(http.StatusCreated)
+		_ = json.NewEncoder(w).Encode(buildkite.Build{ID: "uuid-r", Number: 3})
+	})
+	p, st, _, _ := newBuildkiteTestProvider(t, buildkite.WebhookModeToken, "s", bk)
+
+	p.Spawn(context.Background(), "knot.example.com", "rkey-r",
+		&tangled.Pipeline_TriggerMetadata{
+			Push: &tangled.Pipeline_PushTriggerData{
+				NewSha: "abc", Ref: "refs/heads/main",
+			},
+		},
+		// No `org:` under tack.buildkite — must fall back to the
+		// provider's defaultOrg AND persist that resolved value.
+		[]*tangled.Pipeline_Workflow{
+			{Name: "ci.yml", Raw: "tack:\n  buildkite:\n    pipeline: mypipe\n"},
+		},
+	)
+
+	deadline := time.Now().Add(2 * time.Second)
+	var ref *BuildkiteBuildRef
+	for time.Now().Before(deadline) {
+		var err error
+		ref, err = st.LookupBuildkiteBuildByUUID(context.Background(), "uuid-r")
+		if err != nil {
+			t.Fatalf("lookup: %v", err)
+		}
+		if ref != nil {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if ref == nil {
+		t.Fatal("buildkite build row not persisted within deadline")
+	}
+	// The whole point of the change: ref.Org records the org the
+	// build was created against, not "" (which would hand off to
+	// whatever defaultOrg happens to be at read time).
+	if ref.Org != "myorg" {
+		t.Fatalf("ref.Org = %q; want %q (resolved defaultOrg)",
+			ref.Org, "myorg")
+	}
+
+	// Belt-and-braces: simulate defaultOrg drifting after the row
+	// was written. Logs() should still target the org persisted on
+	// the row, not the new default. We swap defaultOrg out and
+	// stand up a sibling httptest server that fails the test if
+	// anything but /organizations/myorg/ is requested.
+	gotPath := make(chan string, 1)
+	logSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath <- r.URL.Path
+		w.WriteHeader(http.StatusOK)
+		_ = json.NewEncoder(w).Encode(buildkite.Build{
+			ID: "uuid-r", Number: 3, Jobs: nil,
+		})
+	}))
+	t.Cleanup(logSrv.Close)
+	prev := buildkite.APIBase
+	buildkite.APIBase = logSrv.URL
+	t.Cleanup(func() { buildkite.APIBase = prev })
+
+	p.defaultOrg = "newdefault"
+	ch, err := p.Logs(context.Background(), "knot.example.com", "rkey-r", "ci.yml")
+	if err != nil {
+		t.Fatalf("Logs: %v", err)
+	}
+	// Drain so the goroutine completes; we only care about the
+	// initial GetBuild path.
+	for range ch {
+	}
+	select {
+	case path := <-gotPath:
+		if !strings.Contains(path, "/organizations/myorg/") {
+			t.Fatalf("Logs hit %q; want path containing /organizations/myorg/", path)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Logs did not call GetBuild")
+	}
+}
+
 // TestBuildkiteSpawnInvalidYAML proves a workflow without the
 // required `tack.buildkite.pipeline` field is skipped — no API
 // call, no DB row, no status. A misconfigured workflow shouldn't
