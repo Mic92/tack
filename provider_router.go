@@ -58,6 +58,7 @@ func (r *providerRouter) Spawn(
 	ctx context.Context,
 	knot string,
 	pipelineRkey string,
+	actor string,
 	trigger *tangled.Pipeline_TriggerMetadata,
 	workflows []*tangled.Pipeline_Workflow,
 ) {
@@ -80,7 +81,9 @@ func (r *providerRouter) Spawn(
 		}
 		// Hand the workflow off as a single-element slice so the
 		// downstream provider's existing Spawn loop runs unchanged.
-		p.Spawn(ctx, knot, pipelineRkey, trigger,
+		// actor passes through verbatim; the router doesn't
+		// authorize, it just dispatches.
+		p.Spawn(ctx, knot, pipelineRkey, actor, trigger,
 			[]*tangled.Pipeline_Workflow{wf},
 		)
 	}

@@ -73,17 +73,25 @@ type Provider interface {
 	// knot is the knot hostname the trigger arrived on; it's the
 	// authority half of the pipeline ATURI that pipeline.status
 	// records reference. pipelineRkey is the trigger record's rkey
-	// on that knot. trigger is the decoded record's TriggerMetadata
-	// (may be nil — the lexicon doesn't enforce its presence) and
-	// carries the commit/branch/PR data a real CI provider needs to
-	// kick off a build. workflows is the unmodified slice from the
-	// decoded sh.tangled.pipeline record; implementations should
-	// tolerate nil entries and zero-length names defensively, since
-	// the lexicon doesn't enforce either.
+	// on that knot. actor is the DID that the knot consumer has
+	// already authorized to spawn this work; concretely, the
+	// publisher of the originating sh.tangled.repo record (i.e.
+	// the repo owner). It is guaranteed non-empty: the consumer
+	// never invokes Spawn for an unauthorized trigger, so providers
+	// can treat actor as "the identity to attribute this run to"
+	// without re-checking authorization. trigger is the decoded
+	// record's TriggerMetadata (may be nil; the lexicon doesn't
+	// enforce its presence) and carries the commit/branch/PR data
+	// a real CI provider needs to kick off a build. workflows is
+	// the unmodified slice from the decoded sh.tangled.pipeline
+	// record; implementations should tolerate nil entries and
+	// zero-length names defensively, since the lexicon doesn't
+	// enforce either.
 	Spawn(
 		ctx context.Context,
 		knot string,
 		pipelineRkey string,
+		actor string,
 		trigger *tangled.Pipeline_TriggerMetadata,
 		workflows []*tangled.Pipeline_Workflow,
 	)

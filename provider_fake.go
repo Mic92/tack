@@ -81,6 +81,7 @@ func (p *fakeProvider) Spawn(
 	ctx context.Context,
 	knot string,
 	pipelineRkey string,
+	_ string,
 	_ *tangled.Pipeline_TriggerMetadata,
 	workflows []*tangled.Pipeline_Workflow,
 ) {

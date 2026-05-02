@@ -188,6 +188,7 @@ func (p *buildkiteProvider) Spawn(
 	ctx context.Context,
 	knot string,
 	pipelineRkey string,
+	actor string,
 	trigger *tangled.Pipeline_TriggerMetadata,
 	workflows []*tangled.Pipeline_Workflow,
 ) {
@@ -203,7 +204,7 @@ func (p *buildkiteProvider) Spawn(
 			continue
 		}
 		wf := wf
-		go p.spawnWorkflow(ctx, knot, pipelineRkey, trigger, wf)
+		go p.spawnWorkflow(ctx, knot, pipelineRkey, actor, trigger, wf)
 	}
 }
 
@@ -212,10 +213,16 @@ func (p *buildkiteProvider) Spawn(
 // nothing in tack consumes the result, and a failed Spawn just
 // surfaces as the absence of any status update for the affected
 // workflow.
+//
+// actor is the DID the knot consumer authorized to spawn this work
+// (the publishing repo owner). It's surfaced in the per-workflow
+// logger so operator-side audits can join Buildkite logs back to the
+// triggering Tangled identity even before the build itself is up.
 func (p *buildkiteProvider) spawnWorkflow(
 	ctx context.Context,
 	knot string,
 	pipelineRkey string,
+	actor string,
 	trigger *tangled.Pipeline_TriggerMetadata,
 	wf *tangled.Pipeline_Workflow,
 ) {
@@ -223,6 +230,7 @@ func (p *buildkiteProvider) spawnWorkflow(
 		"knot", knot,
 		"pipeline_rkey", pipelineRkey,
 		"workflow", wf.Name,
+		"actor", actor,
 	)
 
 	cfg, err := parseWorkflowConfig(wf.Raw)

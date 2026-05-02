@@ -88,6 +88,17 @@ type knotConsumer struct {
 	// over the decoded record and lets the provider publish status
 	// records back through its own broker connection.
 	provider Provider
+
+	// store, hostname, and ownerDID are the inputs to the
+	// pre-dispatch authorization check. We hold them on the
+	// consumer (instead of threading them through every call) so
+	// process(), which runs once per inbound knot event on a
+	// worker goroutine, can ask `is this trigger allowed?` against
+	// the persisted Tangled membership state without the rest of
+	// tack having to know it cares.
+	store    *store
+	hostname string
+	ownerDID string
 }
 
 // Compile-time interface conformance check.
@@ -123,7 +134,14 @@ func startKnotConsumer(ctx context.Context, cfg config, st *store, provider Prov
 		return nil, fmt.Errorf("open knot cursor store: %w", err)
 	}
 
-	kc := &knotConsumer{log: logger, cursors: cursorStore, provider: provider}
+	kc := &knotConsumer{
+		log:      logger,
+		cursors:  cursorStore,
+		provider: provider,
+		store:    st,
+		hostname: cfg.Hostname,
+		ownerDID: cfg.OwnerDID,
+	}
 
 	ccfg := eventconsumer.NewConsumerConfig()
 	ccfg.Logger = logger
@@ -260,11 +278,57 @@ func (k *knotConsumer) process(ctx context.Context, src eventconsumer.Source, ms
 			"workflows", len(p.Workflows),
 		)
 
+		// Authorization gate. The knot's /events stream will hand
+		// us every pipeline record it publishes, including ones
+		// for repos that never opted into us. Being subscribed
+		// to a knot says nothing about which repos on it we
+		// actually serve. Without this check, any DID that can
+		// publish a sh.tangled.pipeline record on a knot we
+		// already watch could trigger CI on our spindle.
+		//
+		// We consult the persisted state mirrored from the AT
+		// Proto firehose: the trigger's repo must have declared
+		// us as its spindle on this knot, and its publisher DID
+		// must be the spindle owner or a member they vouched for
+		// via sh.tangled.spindle.member. See
+		// store.AuthorizePipelineActor for the precise rules.
+		ok, reason, err := k.store.AuthorizePipelineActor(
+			ctx, k.hostname, src.Key(), k.ownerDID,
+			repoDid, repoName,
+		)
+		if err != nil {
+			// SQL/IO failure (not a denial). Log and refuse to
+			// spawn rather than fail-open: a transient store
+			// error during shutdown shouldn't be allowed to
+			// punch a hole in the security gate.
+			k.log.Error("authorize pipeline trigger",
+				"err", err,
+				"knot", src.Key(),
+				"rkey", msg.Rkey,
+				"repo_did", repoDid,
+				"repo", repoName,
+			)
+			return err
+		}
+		if !ok {
+			k.log.Warn("rejecting unauthorized pipeline trigger",
+				"knot", src.Key(),
+				"rkey", msg.Rkey,
+				"repo_did", repoDid,
+				"repo", repoName,
+				"reason", reason,
+			)
+			return nil
+		}
+
 		// Hand the trigger to whichever Provider was configured.
 		// Spawn is non-blocking — it fans out into provider-owned
 		// goroutines so this worker can move on to the next event.
 		// The provider keeps ctx around for shutdown coordination.
-		k.provider.Spawn(ctx, src.Key(), msg.Rkey, p.TriggerMetadata, p.Workflows)
+		// repoDid is the actor: the publisher of the originating
+		// sh.tangled.repo record, which AuthorizePipelineActor
+		// just confirmed is allowed to spawn work here.
+		k.provider.Spawn(ctx, src.Key(), msg.Rkey, repoDid, p.TriggerMetadata, p.Workflows)
 
 	default:
 		// Knots may publish other record types over the same stream; we

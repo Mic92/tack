@@ -219,6 +219,81 @@ func (s *store) GetRepo(ctx context.Context, did, rkey string) (knot, spindle st
 	return knot, spindle, nil
 }
 
+// AuthorizePipelineActor reports whether a pipeline trigger that
+// arrived on knot for repo (repoOwnerDID, repoName) should be allowed
+// to spawn work on this spindle. Both halves of the answer are
+// derived from the persisted Tangled state in spindle_members and
+// repos: the network's own authorization records, mirrored here from
+// the firehose by jetstream.go.
+//
+// The check is two independent gates; both must hold:
+//
+//  1. **Repo claim**: a sh.tangled.repo record exists naming
+//     hostname as its CI spindle AND knot as its host knot,
+//     published by repoOwnerDID with the matching name. Without this
+//     a knot we already happen to be subscribed to (because *some*
+//     repo on it points at us) could otherwise smuggle in pipeline
+//     triggers for unrelated repos that never opted into us.
+//
+//  2. **Actor membership**: repoOwnerDID is either the spindle owner
+//     itself, or has been authorized via a sh.tangled.spindle.member
+//     record published by the spindle owner. The publisher (`did`)
+//     of that membership grant must equal ownerDID. Anyone can
+//     publish a member record naming anyone, so trusting unsigned
+//     grants would let any DID grant itself access. We do NOT match
+//     against the record's `instance` column because the upstream
+//     ecosystem stores it inconsistently (URL vs hostname), and a
+//     tack instance only ever speaks for a single hostname anyway.
+//
+// reason is a short, log-friendly description of why authorization
+// failed when ok is false; it is empty when ok is true. Errors
+// reported here are SQL/IO failures, never policy denials; those
+// surface as ok=false with a populated reason.
+func (s *store) AuthorizePipelineActor(
+	ctx context.Context,
+	hostname, knot, ownerDID, repoOwnerDID, repoName string,
+) (ok bool, reason string, err error) {
+	// We can't authorize an unknown actor or an unidentified repo:
+	// every gate below joins on these. Bail before touching SQLite
+	// so a malformed trigger logs cleanly instead of triggering a
+	// "no rows" miss that could be confused with a real denial.
+	if repoOwnerDID == "" {
+		return false, "trigger has no repo did", nil
+	}
+	if repoName == "" {
+		return false, "trigger has no repo name", nil
+	}
+
+	// Gate 1: this specific repo opted into us on this specific knot.
+	var n int
+	if err := s.db.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM repos
+          WHERE did = ? AND name = ? AND knot = ? AND spindle = ?`,
+		repoOwnerDID, repoName, knot, hostname,
+	).Scan(&n); err != nil {
+		return false, "", fmt.Errorf("count repo claim: %w", err)
+	}
+	if n == 0 {
+		return false, "no repo record claims this spindle on this knot", nil
+	}
+
+	// Gate 2: actor is the spindle owner, or vouched for by them.
+	if repoOwnerDID == ownerDID {
+		return true, "", nil
+	}
+	if err := s.db.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM spindle_members
+          WHERE did = ? AND subject = ?`,
+		ownerDID, repoOwnerDID,
+	).Scan(&n); err != nil {
+		return false, "", fmt.Errorf("count membership: %w", err)
+	}
+	if n == 0 {
+		return false, "actor is not a spindle member", nil
+	}
+	return true, "", nil
+}
+
 // IsKnotWanted reports whether any repo currently stored still names the
 // given hostname as its spindle and the given knot as its host. After a
 // repo update or delete this is the question we ask to decide whether

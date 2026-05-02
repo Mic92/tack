@@ -77,7 +77,7 @@ func TestBuildkiteSpawn(t *testing.T) {
 		{Name: "test.yml", Raw: "tack:\n  buildkite:\n    pipeline: mypipe\n"},
 	}
 
-	p.Spawn(context.Background(), "knot.example.com", "rkey-1", trigger, workflows)
+	p.Spawn(context.Background(), "knot.example.com", "rkey-1", "did:plc:actor", trigger, workflows)
 
 	// Spawn fans out into goroutines; wait briefly for the side
 	// effects to land. The store row is the load-bearing artifact
@@ -137,7 +137,7 @@ func TestBuildkiteSpawnNoCommit(t *testing.T) {
 	})
 	p, st, _, _ := newBuildkiteTestProvider(t, buildkite.WebhookModeToken, "secret", bk)
 
-	p.Spawn(context.Background(), "knot.example.com", "rkey-1",
+	p.Spawn(context.Background(), "knot.example.com", "rkey-1", "did:plc:actor",
 		&tangled.Pipeline_TriggerMetadata{Manual: &tangled.Pipeline_ManualTriggerData{}},
 		[]*tangled.Pipeline_Workflow{{Name: "test.yml",
 			Raw: "tack:\n  buildkite:\n    pipeline: mypipe\n"}},
@@ -189,7 +189,7 @@ func TestBuildkiteSpawnWorkflowConfig(t *testing.T) {
 		},
 	}
 
-	p.Spawn(context.Background(), "knot.example.com", "rkey-x", trigger,
+	p.Spawn(context.Background(), "knot.example.com", "rkey-x", "did:plc:actor", trigger,
 		[]*tangled.Pipeline_Workflow{{Name: "ci.yml", Raw: raw}})
 
 	select {
@@ -272,7 +272,7 @@ func TestBuildkiteSpawnPersistsResolvedOrg(t *testing.T) {
 	})
 	p, st, _, _ := newBuildkiteTestProvider(t, buildkite.WebhookModeToken, "s", bk)
 
-	p.Spawn(context.Background(), "knot.example.com", "rkey-r",
+	p.Spawn(context.Background(), "knot.example.com", "rkey-r", "did:plc:actor",
 		&tangled.Pipeline_TriggerMetadata{
 			Push: &tangled.Pipeline_PushTriggerData{
 				NewSha: "abc", Ref: "refs/heads/main",
@@ -357,7 +357,7 @@ func TestBuildkiteSpawnInvalidYAML(t *testing.T) {
 	})
 	p, st, _, _ := newBuildkiteTestProvider(t, buildkite.WebhookModeToken, "s", bk)
 
-	p.Spawn(context.Background(), "knot.example.com", "rkey-z",
+	p.Spawn(context.Background(), "knot.example.com", "rkey-z", "did:plc:actor",
 		&tangled.Pipeline_TriggerMetadata{
 			Push: &tangled.Pipeline_PushTriggerData{NewSha: "abc", Ref: "refs/heads/main"},
 		},

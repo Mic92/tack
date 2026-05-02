@@ -378,6 +378,129 @@ func TestBuildkiteCreatedUnixNSBackfill(t *testing.T) {
 	}
 }
 
+// TestAuthorizePipelineActor exercises every gate of the
+// authorization helper end-to-end. The case table covers the matrix
+// of {repo claim present, member grant present, actor is owner} and
+// pins the negative-path failure reasons, which the knot consumer
+// surfaces verbatim into its denial logs.
+func TestAuthorizePipelineActor(t *testing.T) {
+	const (
+		hostname = "spindle.example"
+		knot     = "knot.example"
+		owner    = "did:plc:owner"
+		repoOwn  = "did:plc:alice"
+		repoName = "myrepo"
+	)
+	ctx := context.Background()
+
+	t.Run("missing repo did", func(t *testing.T) {
+		s := newTestStore(t)
+		ok, reason, err := s.AuthorizePipelineActor(ctx,
+			hostname, knot, owner, "", repoName)
+		if err != nil || ok {
+			t.Fatalf("got ok=%v err=%v; want ok=false err=nil", ok, err)
+		}
+		if reason == "" {
+			t.Fatal("expected non-empty reason")
+		}
+	})
+
+	t.Run("repo not on this spindle/knot", func(t *testing.T) {
+		s := newTestStore(t)
+		// Repo exists but with the wrong knot: the trigger
+		// arrived on knot.example but the repo opted into a
+		// different host. Must be rejected.
+		if err := s.UpsertRepo(ctx, repoOwn, "rk1",
+			"other.knot", repoName, hostname, "", "t"); err != nil {
+			t.Fatal(err)
+		}
+		ok, reason, err := s.AuthorizePipelineActor(ctx,
+			hostname, knot, owner, repoOwn, repoName)
+		if err != nil || ok {
+			t.Fatalf("got ok=%v err=%v reason=%q", ok, err, reason)
+		}
+	})
+
+	t.Run("repo on wrong spindle", func(t *testing.T) {
+		s := newTestStore(t)
+		// Right knot, but spindle is someone else.
+		if err := s.UpsertRepo(ctx, repoOwn, "rk1",
+			knot, repoName, "other.spindle", "", "t"); err != nil {
+			t.Fatal(err)
+		}
+		ok, _, err := s.AuthorizePipelineActor(ctx,
+			hostname, knot, owner, repoOwn, repoName)
+		if err != nil || ok {
+			t.Fatalf("got ok=%v err=%v", ok, err)
+		}
+	})
+
+	t.Run("repo claims us but actor not a member", func(t *testing.T) {
+		s := newTestStore(t)
+		if err := s.UpsertRepo(ctx, repoOwn, "rk1",
+			knot, repoName, hostname, "", "t"); err != nil {
+			t.Fatal(err)
+		}
+		ok, reason, err := s.AuthorizePipelineActor(ctx,
+			hostname, knot, owner, repoOwn, repoName)
+		if err != nil || ok {
+			t.Fatalf("got ok=%v err=%v reason=%q", ok, err, reason)
+		}
+	})
+
+	t.Run("membership granted by non-owner is ignored", func(t *testing.T) {
+		s := newTestStore(t)
+		if err := s.UpsertRepo(ctx, repoOwn, "rk1",
+			knot, repoName, hostname, "", "t"); err != nil {
+			t.Fatal(err)
+		}
+		// A member record published by anyone other than the
+		// spindle owner must NOT count, otherwise self-grants
+		// would bypass authorization entirely.
+		if err := s.UpsertSpindleMember(ctx,
+			"did:plc:rando", "mk1", hostname, repoOwn, "t"); err != nil {
+			t.Fatal(err)
+		}
+		ok, _, err := s.AuthorizePipelineActor(ctx,
+			hostname, knot, owner, repoOwn, repoName)
+		if err != nil || ok {
+			t.Fatalf("got ok=%v err=%v", ok, err)
+		}
+	})
+
+	t.Run("owner-granted member is allowed", func(t *testing.T) {
+		s := newTestStore(t)
+		if err := s.UpsertRepo(ctx, repoOwn, "rk1",
+			knot, repoName, hostname, "", "t"); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.UpsertSpindleMember(ctx,
+			owner, "mk1", hostname, repoOwn, "t"); err != nil {
+			t.Fatal(err)
+		}
+		ok, _, err := s.AuthorizePipelineActor(ctx,
+			hostname, knot, owner, repoOwn, repoName)
+		if err != nil || !ok {
+			t.Fatalf("got ok=%v err=%v; want ok=true", ok, err)
+		}
+	})
+
+	t.Run("spindle owner triggers their own repo", func(t *testing.T) {
+		s := newTestStore(t)
+		// Owner needs no membership row to act on a repo they
+		// themselves published. Just the repo-claim gate.
+		if err := s.UpsertRepo(ctx, owner, "rk1",
+			knot, repoName, hostname, "", "t"); err != nil {
+			t.Fatal(err)
+		}
+		ok, _, err := s.AuthorizePipelineActor(ctx,
+			hostname, knot, owner, owner, repoName)
+		if err != nil || !ok {
+			t.Fatalf("got ok=%v err=%v; want ok=true", ok, err)
+		}
+	})
+}
+
 // countRows is a small SELECT COUNT(*) helper used by lifecycle tests
 // to verify deletes actually removed the row. Table name is interpolated
 // directly because callers pass a constant from the schema, not user

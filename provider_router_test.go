@@ -38,6 +38,7 @@ func (s *stubProvider) Spawn(
 	_ context.Context,
 	_ string,
 	_ string,
+	_ string,
 	_ *tangled.Pipeline_TriggerMetadata,
 	workflows []*tangled.Pipeline_Workflow,
 ) {
@@ -97,7 +98,7 @@ func newRouterTest() (*providerRouter, *stubProvider, *stubProvider) {
 func TestProviderRouterSpawnRoutesByYAMLKey(t *testing.T) {
 	r, a, b := newRouterTest()
 
-	r.Spawn(context.Background(), "knot", "rkey", nil,
+	r.Spawn(context.Background(), "knot", "rkey", "did:plc:actor", nil,
 		[]*tangled.Pipeline_Workflow{
 			{Name: "wf-a.yml", Raw: "tack:\n  a: {}\n"},
 			{Name: "wf-b.yml", Raw: "tack:\n  b: {}\n"},
@@ -120,7 +121,7 @@ func TestProviderRouterSpawnFirstYAMLKeyWins(t *testing.T) {
 
 	// `b` is listed first under `tack:` so it should claim the
 	// workflow even though both keys are registered.
-	r.Spawn(context.Background(), "knot", "rkey", nil,
+	r.Spawn(context.Background(), "knot", "rkey", "did:plc:actor", nil,
 		[]*tangled.Pipeline_Workflow{
 			{Name: "both.yml", Raw: "tack:\n  b: {}\n  a: {}\n"},
 		},
@@ -140,7 +141,7 @@ func TestProviderRouterSpawnFirstYAMLKeyWins(t *testing.T) {
 func TestProviderRouterSpawnSkipsUnroutable(t *testing.T) {
 	r, a, b := newRouterTest()
 
-	r.Spawn(context.Background(), "knot", "rkey", nil,
+	r.Spawn(context.Background(), "knot", "rkey", "did:plc:actor", nil,
 		[]*tangled.Pipeline_Workflow{
 			// No `tack:` key at all.
 			{Name: "bare.yml", Raw: "steps: []\n"},
