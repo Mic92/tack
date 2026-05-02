@@ -5,6 +5,12 @@ CI on alternate providers and reports their results back
 to Tangled using standard ATProto records so they show up natively
 in Tangled's UI.
 
+> [!WARNING]
+>
+> **Project status:** Tack is early and experimental software.
+> This repo itself uses Tack and I (mitchellh) use Tack for my projects,
+> but it is still new and relatively unproven.
+
 ## Example
 
 A Tangled workflow that fires a Buildkite pipeline on every push to
@@ -17,6 +23,9 @@ when:
     branch: ["main"]
   - event: ["pull_request"]
     branch: ["main"]
+
+# this does nothing for Tack but is required by Tangled
+engine: nixery
 
 tack:
   buildkite:
@@ -42,17 +51,30 @@ This makes even 3rd party CIs integrate first class into Tangled so their
 status, counts, etc. can show up inline in things like pull requests.
 
 ```
-                 sh.tangled.pipeline
-  Jetstream  ───────────────────────▶  tack
-                                        │
-                                        │  Create Build
-                                        ▼
-                                    Buildkite
-                                        │
-                                        │  webhooks
-                                        ▼
-                                       tack  ──── /events (WebSocket) ────▶  Tangled appview
-                                                  sh.tangled.pipeline.status
+   Jetstream                Knot /events (WebSocket)
+   sh.tangled.repo          sh.tangled.pipeline triggers
+   sh.tangled.spindle.member
+   sh.tangled.repo.collaborator
+        │                            │
+        │ (discover knots            │
+        │  + membership)             │
+        ▼                            ▼
+       ╭────────────────────────────────╮
+       │             tack               │
+       │  ╭──────────────────────────╮  │
+       │  │     provider router      │  │   selected per-workflow
+       │  │   (fake │ buildkite)     │  │   via `tack: { … }` YAML
+       │  ╰──────────────────────────╯  │
+       ╰────────────────────────────────╯
+                       │
+                       │  Create Build (REST)
+                       ▼
+                   Buildkite
+                       │
+                       │  POST /webhooks/buildkite
+                       ▼
+                      tack  ──── /events (WebSocket) ────▶  Tangled appview
+                                 sh.tangled.pipeline.status
 ```
 
 ## Configuration
