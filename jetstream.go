@@ -78,12 +78,13 @@ func startJetstream(ctx context.Context, cfg config, st *store, knots KnotConsum
 	clientCfg.WebsocketURL = cfg.JetstreamURL
 	clientCfg.WantedCollections = collections
 
-	// The handler closes over `st`, `knots` and the spindle hostname so
-	// the scheduler signature stays plain `func(ctx, *Event) error` and
-	// applyCommit can hand the knot consumer new sources as soon as
-	// matching repo records arrive.
+	// The handler closes over `st`, `knots`, the spindle hostname and
+	// the owner DID so the scheduler signature stays plain
+	// `func(ctx, *Event) error` and applyCommit can hand the knot
+	// consumer new sources as soon as matching repo records arrive
+	// (gated on the publisher being an authorized actor).
 	handler := func(ctx context.Context, evt *jsmodels.Event) error {
-		return handleJetstreamEvent(ctx, st, knots, cfg.Hostname, evt)
+		return handleJetstreamEvent(ctx, st, knots, cfg.Hostname, cfg.OwnerDID, evt)
 	}
 
 	// Re-attach the component-scoped logger so handler — which the
@@ -177,7 +178,7 @@ func startJetstream(ctx context.Context, cfg config, st *store, knots KnotConsum
 //     lose a row that the rest of tack relies on. Leaving the cursor
 //     in place gives the next reconnect (which rewinds by
 //     jetstreamRewind) a chance to re-deliver and re-apply it.
-func handleJetstreamEvent(ctx context.Context, st *store, knots KnotConsumer, hostname string, evt *jsmodels.Event) error {
+func handleJetstreamEvent(ctx context.Context, st *store, knots KnotConsumer, hostname, ownerDID string, evt *jsmodels.Event) error {
 	// We only care about commits, which are the actual record CRUD
 	// operations on a user's PDS. Account/identity events are ignored
 	// for now; if we ever care about handle changes we can add them.
@@ -189,7 +190,7 @@ func handleJetstreamEvent(ctx context.Context, st *store, knots KnotConsumer, ho
 	// Dispatch on collection. Unknown collections shouldn't happen given
 	// our wantedCollections filter, but be defensive — jetstream may
 	// send schema changes ahead of us updating the filter.
-	applyErr := applyCommit(ctx, st, knots, hostname, evt)
+	applyErr := applyCommit(ctx, st, knots, hostname, ownerDID, evt)
 	if applyErr != nil {
 		logger.Error("apply commit",
 			"err", applyErr,
@@ -261,13 +262,13 @@ func isBadRecord(err error) bool {
 
 // applyCommit routes a commit to the right store mutation based on its
 // collection NSID and operation.
-func applyCommit(ctx context.Context, st *store, knots KnotConsumer, hostname string, evt *jsmodels.Event) error {
+func applyCommit(ctx context.Context, st *store, knots KnotConsumer, hostname, ownerDID string, evt *jsmodels.Event) error {
 	c := evt.Commit
 	switch c.Collection {
 	case tangled.SpindleMemberNSID:
-		return applySpindleMember(ctx, st, evt.Did, c)
+		return applySpindleMember(ctx, st, knots, hostname, ownerDID, evt.Did, c)
 	case tangled.RepoNSID:
-		return applyRepo(ctx, st, knots, hostname, evt.Did, c)
+		return applyRepo(ctx, st, knots, hostname, ownerDID, evt.Did, c)
 	case tangled.RepoCollaboratorNSID:
 		return applyRepoCollaborator(ctx, st, evt.Did, c)
 	default:
@@ -279,23 +280,61 @@ func applyCommit(ctx context.Context, st *store, knots KnotConsumer, hostname st
 	}
 }
 
-func applySpindleMember(ctx context.Context, st *store, did string, c *jsmodels.Commit) error {
+func applySpindleMember(ctx context.Context, st *store, knots KnotConsumer, hostname, ownerDID, did string, c *jsmodels.Commit) error {
 	switch c.Operation {
 	case jsOpCreate, jsOpUpdate:
+		// Capture the previous subject. Necessary because a same-rkey
+		// update can move the grant to a different DID, in which case
+		// the *old* subject's knots may need to be released even as
+		// the new subject's are picked up.
+		oldSubject, err := st.GetSpindleMember(ctx, did, c.RKey)
+		if err != nil {
+			return err
+		}
+
 		var rec tangled.SpindleMember
 		if err := json.Unmarshal(c.Record, &rec); err != nil {
 			// Decode failures are a permanent property of the record's
 			// bytes; mark as bad so the cursor can advance past it.
 			return badRecord(fmt.Errorf("decode spindle.member: %w", err))
 		}
-		return st.UpsertSpindleMember(ctx, did, c.RKey, rec.Instance, rec.Subject, rec.CreatedAt)
+		if err := st.UpsertSpindleMember(ctx, did, c.RKey, rec.Instance, rec.Subject, rec.CreatedAt); err != nil {
+			return err
+		}
+
+		// Only grants published by the spindle owner actually change
+		// authorization (see IsAuthorizedActor). Forged grants are
+		// stored but don't move the needle, so don't bother
+		// reconciling on them: it would be a no-op at best and
+		// add log noise.
+		if did != ownerDID {
+			return nil
+		}
+		if oldSubject != "" && oldSubject != rec.Subject {
+			if err := reconcileMember(ctx, st, knots, hostname, ownerDID, oldSubject); err != nil {
+				return err
+			}
+		}
+		return reconcileMember(ctx, st, knots, hostname, ownerDID, rec.Subject)
+
 	case jsOpDelete:
-		return st.DeleteSpindleMember(ctx, did, c.RKey)
+		oldSubject, err := st.GetSpindleMember(ctx, did, c.RKey)
+		if err != nil {
+			return err
+		}
+		if err := st.DeleteSpindleMember(ctx, did, c.RKey); err != nil {
+			return err
+		}
+		// As above: only the owner's grants matter for authorization.
+		if did != ownerDID || oldSubject == "" {
+			return nil
+		}
+		return reconcileMember(ctx, st, knots, hostname, ownerDID, oldSubject)
 	}
 	return nil
 }
 
-func applyRepo(ctx context.Context, st *store, knots KnotConsumer, hostname string, did string, c *jsmodels.Commit) error {
+func applyRepo(ctx context.Context, st *store, knots KnotConsumer, hostname, ownerDID, did string, c *jsmodels.Commit) error {
 	switch c.Operation {
 	case jsOpCreate, jsOpUpdate:
 		var rec tangled.Repo
@@ -322,7 +361,7 @@ func applyRepo(ctx context.Context, st *store, knots KnotConsumer, hostname stri
 		}
 
 		newSpindle := deref(rec.Spindle)
-		return reconcileKnot(ctx, st, knots, hostname,
+		return reconcileKnot(ctx, st, knots, hostname, ownerDID, did,
 			oldKnot, oldSpindle,
 			rec.Knot, newSpindle,
 		)
@@ -339,7 +378,7 @@ func applyRepo(ctx context.Context, st *store, knots KnotConsumer, hostname stri
 		if err := st.DeleteRepo(ctx, did, c.RKey); err != nil {
 			return err
 		}
-		return reconcileKnot(ctx, st, knots, hostname,
+		return reconcileKnot(ctx, st, knots, hostname, ownerDID, did,
 			oldKnot, oldSpindle,
 			"", "",
 		)
@@ -353,19 +392,21 @@ func applyRepo(ctx context.Context, st *store, knots KnotConsumer, hostname stri
 // post-mutation truth.
 //
 // Logic:
-//   - If the new record names us as its spindle, ensure we're
-//     subscribed to its knot (AddKnot is idempotent, so calling it on
-//     an already-watched knot is cheap).
+//   - If the new record names us as its spindle AND the publisher is
+//     an authorized actor (spindle owner or owner-vouched member),
+//     ensure we're subscribed to its knot. Without the membership
+//     check, any firehose publisher could pin us to an attacker-chosen
+//     knot just by publishing a sh.tangled.repo record naming us.
 //   - If the old record named us as its spindle, check whether any
-//     other repo still references that knot through us; if not,
-//     RemoveKnot it. Skip this when the knot didn't change AND the
-//     spindle didn't move away from us, because then nothing actually
-//     released our hold.
+//     other authorized repo still references that knot through us;
+//     if not, RemoveKnot it. Skip this when the knot didn't change
+//     AND the spindle didn't move away from us, because then nothing
+//     actually released our hold.
 func reconcileKnot(
 	ctx context.Context,
 	st *store,
 	knots KnotConsumer,
-	hostname string,
+	hostname, ownerDID, publisherDID string,
 	oldKnot, oldSpindle string,
 	newKnot, newSpindle string,
 ) error {
@@ -377,22 +418,84 @@ func reconcileKnot(
 	}
 
 	if newSpindle == hostname && newKnot != "" {
-		knots.AddKnot(ctx, newKnot)
+		ok, err := st.IsAuthorizedActor(ctx, ownerDID, publisherDID)
+		if err != nil {
+			return err
+		}
+		if ok {
+			knots.AddKnot(ctx, newKnot)
+		} else {
+			loggerFrom(ctx).Warn("ignoring repo from unauthorized publisher",
+				"publisher_did", publisherDID,
+				"knot", newKnot,
+			)
+		}
 	}
 
 	// Did we just lose our claim on oldKnot? Two ways that can happen:
 	// the spindle field moved off of us, or the knot field moved to a
 	// different host. Either is a reason to consider unsubscribing
-	// from oldKnot — but only if no *other* repo still has us on it.
+	// from oldKnot, but only if no *other* authorized repo still has
+	// us on it.
 	releasedOld := oldSpindle == hostname && oldKnot != "" &&
 		(newSpindle != hostname || newKnot != oldKnot)
 	if releasedOld {
-		stillWanted, err := st.IsKnotWanted(ctx, hostname, oldKnot)
+		stillWanted, err := st.IsKnotWanted(ctx, hostname, ownerDID, oldKnot)
 		if err != nil {
 			return err
 		}
 		if !stillWanted {
 			knots.RemoveKnot(ctx, oldKnot)
+		}
+	}
+	return nil
+}
+
+// reconcileMember adjusts knot subscriptions after a membership grant
+// or revocation may have changed `subject`'s authorization status.
+// For each knot named by subject's repos that point at us:
+//
+//   - if subject is now authorized, AddKnot (idempotent: already-
+//     subscribed knots are no-ops in the consumer);
+//   - if subject is now unauthorized, ask IsKnotWanted whether any
+//     *other* authorized repo still holds the knot; if not,
+//     RemoveKnot.
+//
+// Without this, a member's repos picked up over the firehose before
+// the grant arrived would never get subscribed (the grant doesn't
+// re-deliver the older repo events), and a revocation would leave
+// the now-unauthorized publisher's knot subscribed until restart.
+func reconcileMember(
+	ctx context.Context,
+	st *store,
+	knots KnotConsumer,
+	hostname, ownerDID, subject string,
+) error {
+	if knots == nil || subject == "" {
+		return nil
+	}
+	knotsForSubject, err := st.KnotsForOwner(ctx, hostname, subject)
+	if err != nil {
+		return err
+	}
+	if len(knotsForSubject) == 0 {
+		return nil
+	}
+	authorized, err := st.IsAuthorizedActor(ctx, ownerDID, subject)
+	if err != nil {
+		return err
+	}
+	for _, k := range knotsForSubject {
+		if authorized {
+			knots.AddKnot(ctx, k)
+			continue
+		}
+		stillWanted, err := st.IsKnotWanted(ctx, hostname, ownerDID, k)
+		if err != nil {
+			return err
+		}
+		if !stillWanted {
+			knots.RemoveKnot(ctx, k)
 		}
 	}
 	return nil

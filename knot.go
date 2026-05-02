@@ -120,7 +120,7 @@ var _ KnotConsumer = (*knotConsumer)(nil)
 func startKnotConsumer(ctx context.Context, cfg config, st *store, provider Provider) (*knotConsumer, error) {
 	logger := loggerFrom(ctx).With("component", "knotconsumer")
 
-	knots, err := st.KnotsForSpindle(ctx, cfg.Hostname)
+	knots, err := st.KnotsForSpindle(ctx, cfg.Hostname, cfg.OwnerDID)
 	if err != nil {
 		return nil, fmt.Errorf("load known knots: %w", err)
 	}

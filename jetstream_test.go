@@ -67,7 +67,7 @@ func TestHandleNonCommitEvent(t *testing.T) {
 		TimeUS: 100,
 		Kind:   jsmodels.EventKindAccount,
 	}
-	if err := handleJetstreamEvent(ctx, s, nil, "", evt); err != nil {
+	if err := handleJetstreamEvent(ctx, s, nil, "", "", evt); err != nil {
 		t.Fatalf("handle: %v", err)
 	}
 	got, err := s.LoadCursor(ctx)
@@ -91,7 +91,7 @@ func TestHandleSpindleMemberCreate(t *testing.T) {
 		CreatedAt: "2026-01-01T00:00:00Z",
 	}
 	evt := commitEvent(12345, "did:plc:owner", tangled.SpindleMemberNSID, jsOpCreate, "rk1", rec)
-	if err := handleJetstreamEvent(ctx, s, nil, "", evt); err != nil {
+	if err := handleJetstreamEvent(ctx, s, nil, "", "", evt); err != nil {
 		t.Fatalf("handle: %v", err)
 	}
 
@@ -119,7 +119,7 @@ func TestHandleSpindleMemberDelete(t *testing.T) {
 		t.Fatalf("seed: %v", err)
 	}
 	evt := commitEvent(99, "did:plc:owner", tangled.SpindleMemberNSID, jsOpDelete, "rk1", nil)
-	if err := handleJetstreamEvent(ctx, s, nil, "", evt); err != nil {
+	if err := handleJetstreamEvent(ctx, s, nil, "", "", evt); err != nil {
 		t.Fatalf("handle: %v", err)
 	}
 	if n := countRows(t, s, "spindle_members"); n != 0 {
@@ -145,7 +145,7 @@ func TestHandleRepoCreateOptionals(t *testing.T) {
 		CreatedAt: "2026-01-01T00:00:00Z",
 	}
 	evt := commitEvent(7, "did:plc:owner", tangled.RepoNSID, jsOpCreate, "repo1", rec)
-	if err := handleJetstreamEvent(ctx, s, nil, "", evt); err != nil {
+	if err := handleJetstreamEvent(ctx, s, nil, "", "", evt); err != nil {
 		t.Fatalf("handle: %v", err)
 	}
 
@@ -169,7 +169,7 @@ func TestHandleRepoCreateOptionals(t *testing.T) {
 		CreatedAt: "2026-01-01T00:00:00Z",
 	}
 	evt2 := commitEvent(8, "did:plc:owner", tangled.RepoNSID, jsOpCreate, "repo2", rec2)
-	if err := handleJetstreamEvent(ctx, s, nil, "", evt2); err != nil {
+	if err := handleJetstreamEvent(ctx, s, nil, "", "", evt2); err != nil {
 		t.Fatalf("handle nil-optionals: %v", err)
 	}
 	err = s.db.QueryRowContext(ctx,
@@ -198,7 +198,7 @@ func TestHandleRepoCollaboratorCreate(t *testing.T) {
 		CreatedAt: "2026-01-01T00:00:00Z",
 	}
 	evt := commitEvent(55, "did:plc:owner", tangled.RepoCollaboratorNSID, jsOpCreate, "c1", rec)
-	if err := handleJetstreamEvent(ctx, s, nil, "", evt); err != nil {
+	if err := handleJetstreamEvent(ctx, s, nil, "", "", evt); err != nil {
 		t.Fatalf("handle: %v", err)
 	}
 
@@ -224,7 +224,7 @@ func TestHandleUnknownCollection(t *testing.T) {
 	ctx := context.Background()
 
 	evt := commitEvent(42, "did:plc:owner", "app.bsky.feed.post", jsOpCreate, "rk", map[string]string{"text": "hi"})
-	if err := handleJetstreamEvent(ctx, s, nil, "", evt); err != nil {
+	if err := handleJetstreamEvent(ctx, s, nil, "", "", evt); err != nil {
 		t.Fatalf("handle: %v", err)
 	}
 	requireCursor(t, s, 42)
@@ -249,7 +249,7 @@ func TestHandleBadRecordAdvancesCursor(t *testing.T) {
 			Record:     json.RawMessage(`{not valid json`),
 		},
 	}
-	if err := handleJetstreamEvent(ctx, s, nil, "", evt); err != nil {
+	if err := handleJetstreamEvent(ctx, s, nil, "", "", evt); err != nil {
 		t.Fatalf("handle should swallow decode error, got: %v", err)
 	}
 	if n := countRows(t, s, "spindle_members"); n != 0 {
@@ -295,7 +295,7 @@ func TestHandleTransientStoreErrorDoesNotAdvanceCursor(t *testing.T) {
 	evt := commitEvent(1000, "did:plc:owner", tangled.SpindleMemberNSID, jsOpCreate, "rk", rec)
 
 	// Expect a non-nil error: handler propagates transient failures.
-	if err := handleJetstreamEvent(ctx, s, nil, "", evt); err == nil {
+	if err := handleJetstreamEvent(ctx, s, nil, "", "", evt); err == nil {
 		t.Fatalf("handle should return transient error, got nil")
 	}
 
@@ -334,12 +334,165 @@ func TestRepoEventSubscribesKnotForOurSpindle(t *testing.T) {
 	evt := commitEvent(1, "did:plc:owner", tangled.RepoNSID, jsOpCreate, "rk", rec)
 
 	fake := &fakeKnotConsumer{}
-	if err := handleJetstreamEvent(ctx, s, fake, ours, evt); err != nil {
+	if err := handleJetstreamEvent(ctx, s, fake, ours, "did:plc:owner", evt); err != nil {
 		t.Fatalf("handle: %v", err)
 	}
 	added := fake.Added()
 	if len(added) != 1 || added[0] != "knot.example" {
 		t.Fatalf("AddKnot calls = %v, want [knot.example]", added)
+	}
+}
+
+// TestRepoEventIgnoresUnauthorizedPublisher pins the high-severity
+// security gate: a sh.tangled.repo record naming us as its spindle
+// must NOT cause an outbound knot subscription unless its publisher
+// is the spindle owner or an owner-vouched member. Without this gate
+// any firehose publisher could force tack to dial an attacker-chosen
+// websocket simply by minting a matching repo record.
+func TestRepoEventIgnoresUnauthorizedPublisher(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+
+	const ours = "tack.example"
+	const owner = "did:plc:owner"
+
+	// did:plc:rando is neither the owner nor a member.
+	spindle := ours
+	rec := tangled.Repo{
+		Knot:      "evil.example",
+		Name:      "myrepo",
+		Spindle:   &spindle,
+		CreatedAt: "2026-01-01T00:00:00Z",
+	}
+	evt := commitEvent(1, "did:plc:rando", tangled.RepoNSID, jsOpCreate, "rk", rec)
+
+	fake := &fakeKnotConsumer{}
+	if err := handleJetstreamEvent(ctx, s, fake, ours, owner, evt); err != nil {
+		t.Fatalf("handle: %v", err)
+	}
+	if added := fake.Added(); len(added) != 0 {
+		t.Fatalf("AddKnot calls = %v, want none (publisher is unauthorized)", added)
+	}
+}
+
+// TestSpindleMemberGrantSubscribesPendingKnots covers the case where
+// a member publishes their sh.tangled.repo *before* the owner's
+// sh.tangled.spindle.member grant arrives over the firehose. Until
+// the grant lands the publisher is unauthorized, so the repo doesn't
+// pull a subscription. Once the grant arrives, the same-rkey reconcile
+// must catch up by AddKnot-ing every knot that member's pending repos
+// already named.
+func TestSpindleMemberGrantSubscribesPendingKnots(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+
+	const ours = "tack.example"
+	const owner = "did:plc:owner"
+	const alice = "did:plc:alice"
+
+	// Step 1: alice publishes a repo claiming us. She isn't a member
+	// yet, so no subscription should happen.
+	spindle := ours
+	repoRec := tangled.Repo{
+		Knot:      "knot.example",
+		Name:      "myrepo",
+		Spindle:   &spindle,
+		CreatedAt: "2026-01-01T00:00:00Z",
+	}
+	repoEvt := commitEvent(1, alice, tangled.RepoNSID, jsOpCreate, "rk", repoRec)
+
+	fake := &fakeKnotConsumer{}
+	if err := handleJetstreamEvent(ctx, s, fake, ours, owner, repoEvt); err != nil {
+		t.Fatalf("handle repo: %v", err)
+	}
+	if added := fake.Added(); len(added) != 0 {
+		t.Fatalf("AddKnot before grant = %v, want none", added)
+	}
+
+	// Step 2: owner publishes a membership grant naming alice. The
+	// reconcile triggered by that grant must subscribe to alice's
+	// already-stored repo's knot.
+	grant := tangled.SpindleMember{
+		Instance:  ours,
+		Subject:   alice,
+		CreatedAt: "2026-01-02T00:00:00Z",
+	}
+	grantEvt := commitEvent(2, owner, tangled.SpindleMemberNSID, jsOpCreate, "mk", grant)
+	if err := handleJetstreamEvent(ctx, s, fake, ours, owner, grantEvt); err != nil {
+		t.Fatalf("handle grant: %v", err)
+	}
+	if added := fake.Added(); len(added) != 1 || added[0] != "knot.example" {
+		t.Fatalf("AddKnot after grant = %v, want [knot.example]", added)
+	}
+}
+
+// TestSpindleMemberRevokeUnsubscribesKnot verifies that revoking a
+// previously-granted membership tears down the only-held-by-that-member
+// knot subscription. Without this, an attacker who briefly held
+// membership could leave us dialing their chosen knot until restart,
+// the exact lingering-subscription concern called out in KNOWN_ISSUES.
+func TestSpindleMemberRevokeUnsubscribesKnot(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+
+	const ours = "tack.example"
+	const owner = "did:plc:owner"
+	const alice = "did:plc:alice"
+
+	// Seed: owner has previously vouched for alice, and alice has
+	// already published a repo on knot.example pointing at us.
+	if err := s.UpsertSpindleMember(ctx, owner, "mk", ours, alice, "t"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.UpsertRepo(ctx, alice, "rk", "knot.example", "myrepo", ours, "", "t"); err != nil {
+		t.Fatal(err)
+	}
+
+	// Owner publishes a delete of the membership grant.
+	revoke := commitEvent(10, owner, tangled.SpindleMemberNSID, jsOpDelete, "mk", nil)
+
+	fake := &fakeKnotConsumer{}
+	if err := handleJetstreamEvent(ctx, s, fake, ours, owner, revoke); err != nil {
+		t.Fatalf("handle revoke: %v", err)
+	}
+	if removed := fake.Removed(); len(removed) != 1 || removed[0] != "knot.example" {
+		t.Fatalf("RemoveKnot calls = %v, want [knot.example]", removed)
+	}
+}
+
+// TestSpindleMemberGrantFromNonOwnerIgnored confirms that a forged
+// membership record published by anyone other than the spindle owner
+// does NOT trigger a knot subscription, even if a matching repo for
+// the named subject exists. This mirrors AuthorizePipelineActor's
+// rule that the membership grant's publisher must equal the spindle
+// owner.
+func TestSpindleMemberGrantFromNonOwnerIgnored(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+
+	const ours = "tack.example"
+	const owner = "did:plc:owner"
+	const alice = "did:plc:alice"
+
+	if err := s.UpsertRepo(ctx, alice, "rk", "knot.example", "myrepo", ours, "", "t"); err != nil {
+		t.Fatal(err)
+	}
+
+	// Forged grant: alice "vouches" for herself. Stored, but must
+	// not flip her into authorized status.
+	forgery := tangled.SpindleMember{
+		Instance:  ours,
+		Subject:   alice,
+		CreatedAt: "2026-01-02T00:00:00Z",
+	}
+	evt := commitEvent(2, alice, tangled.SpindleMemberNSID, jsOpCreate, "mk", forgery)
+
+	fake := &fakeKnotConsumer{}
+	if err := handleJetstreamEvent(ctx, s, fake, ours, owner, evt); err != nil {
+		t.Fatalf("handle forged grant: %v", err)
+	}
+	if added := fake.Added(); len(added) != 0 {
+		t.Fatalf("AddKnot calls = %v, want none (grant publisher != owner)", added)
 	}
 }
 
@@ -361,7 +514,7 @@ func TestRepoEventIgnoresKnotForOtherSpindle(t *testing.T) {
 	evt := commitEvent(1, "did:plc:owner", tangled.RepoNSID, jsOpCreate, "rk", rec)
 
 	fake := &fakeKnotConsumer{}
-	if err := handleJetstreamEvent(ctx, s, fake, "tack.example", evt); err != nil {
+	if err := handleJetstreamEvent(ctx, s, fake, "tack.example", "did:plc:owner", evt); err != nil {
 		t.Fatalf("handle: %v", err)
 	}
 	if added := fake.Added(); len(added) != 0 {
@@ -396,7 +549,7 @@ func TestRepoUpdateSpindleAwayFromUsRemovesKnot(t *testing.T) {
 	evt := commitEvent(1, "did:plc:a", tangled.RepoNSID, jsOpUpdate, "rk", rec)
 
 	fake := &fakeKnotConsumer{}
-	if err := handleJetstreamEvent(ctx, s, fake, ours, evt); err != nil {
+	if err := handleJetstreamEvent(ctx, s, fake, ours, "did:plc:owner", evt); err != nil {
 		t.Fatalf("handle: %v", err)
 	}
 	if added := fake.Added(); len(added) != 0 {
@@ -418,6 +571,17 @@ func TestRepoUpdateSpindleAwayFromUsKeepsKnotIfShared(t *testing.T) {
 	const ours = "tack.example"
 	const knot = "knot.example"
 
+	// Both publishers must be vouched for; otherwise IsKnotWanted's
+	// membership filter would zero them out and we'd unsubscribe
+	// regardless. The reconciliation we want to test only matters
+	// when there is a real authorized hold to keep.
+	if err := s.UpsertSpindleMember(ctx, "did:plc:owner", "mk1", ours, "did:plc:a", "t"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.UpsertSpindleMember(ctx, "did:plc:owner", "mk2", ours, "did:plc:b", "t"); err != nil {
+		t.Fatal(err)
+	}
+
 	// Two repos sharing one knot, both pointed at us.
 	if err := s.UpsertRepo(ctx, "did:plc:a", "rk1", knot, "a", ours, "", "t"); err != nil {
 		t.Fatal(err)
@@ -437,7 +601,7 @@ func TestRepoUpdateSpindleAwayFromUsKeepsKnotIfShared(t *testing.T) {
 	evt := commitEvent(1, "did:plc:a", tangled.RepoNSID, jsOpUpdate, "rk1", rec)
 
 	fake := &fakeKnotConsumer{}
-	if err := handleJetstreamEvent(ctx, s, fake, ours, evt); err != nil {
+	if err := handleJetstreamEvent(ctx, s, fake, ours, "did:plc:owner", evt); err != nil {
 		t.Fatalf("handle: %v", err)
 	}
 	if removed := fake.Removed(); len(removed) != 0 {
@@ -456,6 +620,13 @@ func TestRepoUpdateChangingKnotSwapsSubscription(t *testing.T) {
 	const oldKnot = "old.example"
 	const newKnot = "new.example"
 
+	// Vouch for did:plc:a so reconcileKnot will actually call
+	// AddKnot for the new host. Without the grant the publisher
+	// is unauthorized and the AddKnot half is (correctly) skipped.
+	if err := s.UpsertSpindleMember(ctx, "did:plc:owner", "mk1", ours, "did:plc:a", "t"); err != nil {
+		t.Fatal(err)
+	}
+
 	if err := s.UpsertRepo(ctx, "did:plc:a", "rk", oldKnot, "a", ours, "", "t"); err != nil {
 		t.Fatal(err)
 	}
@@ -470,7 +641,7 @@ func TestRepoUpdateChangingKnotSwapsSubscription(t *testing.T) {
 	evt := commitEvent(1, "did:plc:a", tangled.RepoNSID, jsOpUpdate, "rk", rec)
 
 	fake := &fakeKnotConsumer{}
-	if err := handleJetstreamEvent(ctx, s, fake, ours, evt); err != nil {
+	if err := handleJetstreamEvent(ctx, s, fake, ours, "did:plc:owner", evt); err != nil {
 		t.Fatalf("handle: %v", err)
 	}
 	if added := fake.Added(); len(added) != 1 || added[0] != newKnot {
@@ -496,7 +667,7 @@ func TestRepoDeleteRemovesKnotWhenLast(t *testing.T) {
 	evt := commitEvent(1, "did:plc:a", tangled.RepoNSID, jsOpDelete, "rk", nil)
 
 	fake := &fakeKnotConsumer{}
-	if err := handleJetstreamEvent(ctx, s, fake, ours, evt); err != nil {
+	if err := handleJetstreamEvent(ctx, s, fake, ours, "did:plc:owner", evt); err != nil {
 		t.Fatalf("handle: %v", err)
 	}
 	if removed := fake.Removed(); len(removed) != 1 || removed[0] != knot {
@@ -513,6 +684,15 @@ func TestRepoDeleteKeepsKnotIfShared(t *testing.T) {
 	const ours = "tack.example"
 	const knot = "knot.example"
 
+	// Both publishers vouched for; otherwise IsKnotWanted would
+	// (correctly) report neither holds the knot and we'd unsubscribe.
+	if err := s.UpsertSpindleMember(ctx, "did:plc:owner", "mk1", ours, "did:plc:a", "t"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.UpsertSpindleMember(ctx, "did:plc:owner", "mk2", ours, "did:plc:b", "t"); err != nil {
+		t.Fatal(err)
+	}
+
 	if err := s.UpsertRepo(ctx, "did:plc:a", "rk1", knot, "a", ours, "", "t"); err != nil {
 		t.Fatal(err)
 	}
@@ -522,7 +702,7 @@ func TestRepoDeleteKeepsKnotIfShared(t *testing.T) {
 	evt := commitEvent(1, "did:plc:a", tangled.RepoNSID, jsOpDelete, "rk1", nil)
 
 	fake := &fakeKnotConsumer{}
-	if err := handleJetstreamEvent(ctx, s, fake, ours, evt); err != nil {
+	if err := handleJetstreamEvent(ctx, s, fake, ours, "did:plc:owner", evt); err != nil {
 		t.Fatalf("handle: %v", err)
 	}
 	if removed := fake.Removed(); len(removed) != 0 {

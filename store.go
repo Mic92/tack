@@ -1,22 +1,18 @@
 package main
 
-// SQLite-backed persistence for tack.
+// SQLite-backed persistence for tack. Holds:
 //
-// Two responsibilities live here:
+//   - the jetstream cursor, so restarts resume the firehose where the
+//     previous run left off
+//   - mirrored Tangled state (spindle members, repos, collaborators)
+//     and the authorization helpers built on top of it, used both to
+//     gate inbound pipeline triggers and to decide which knots we
+//     should be subscribed to
+//   - the outbound event log fed to /events websocket subscribers
+//   - the Buildkite build → pipeline mapping the webhook and /logs
+//     handlers look up
 //
-//  1. The jetstream cursor — a microsecond unix timestamp the AT Proto
-//     firehose uses to resume from a specific point. Without persistence
-//     every restart begins at "now" and we'd silently miss any record
-//     published while we were down.
-//
-//  2. Tangled membership state derived from jetstream commits:
-//     sh.tangled.spindle.member, sh.tangled.repo, and
-//     sh.tangled.repo.collaborator. We need this to later answer
-//     "is DID X allowed to trigger a build on this spindle for repo Y?"
-//
-// We use mattn/go-sqlite3, which is the most battle-tested SQLite driver
-// for Go. It requires CGo, which is fine for tack — the project already
-// builds under Nix where a C toolchain is readily available.
+// Per-method docs go into more detail.
 
 import (
 	"context"
@@ -294,15 +290,30 @@ func (s *store) AuthorizePipelineActor(
 	return true, "", nil
 }
 
-// IsKnotWanted reports whether any repo currently stored still names the
-// given hostname as its spindle and the given knot as its host. After a
-// repo update or delete this is the question we ask to decide whether
-// to keep watching that knot or unsubscribe from it.
-func (s *store) IsKnotWanted(ctx context.Context, hostname, knot string) (bool, error) {
+// IsKnotWanted reports whether any *authorized* repo currently stored
+// still names the given hostname as its spindle and the given knot as
+// its host. After a repo update or delete this is the question we ask
+// to decide whether to keep watching that knot or unsubscribe from it.
+//
+// "Authorized" means the repo's publisher (the row's `did` column) is
+// either the spindle owner or has been vouched for by the spindle owner
+// via a sh.tangled.spindle.member record. Without this filter, a non-
+// member could pin us to an arbitrary attacker-chosen knot just by
+// publishing a sh.tangled.repo record naming us as its spindle. See
+// the matching gate in IsAuthorizedActor and AuthorizePipelineActor.
+func (s *store) IsKnotWanted(ctx context.Context, hostname, ownerDID, knot string) (bool, error) {
 	var n int
 	err := s.db.QueryRowContext(ctx,
-		`SELECT COUNT(*) FROM repos WHERE spindle = ? AND knot = ?`,
-		hostname, knot,
+		`SELECT COUNT(*) FROM repos r
+          WHERE r.spindle = ? AND r.knot = ?
+            AND (
+                r.did = ?
+                OR EXISTS (
+                    SELECT 1 FROM spindle_members m
+                     WHERE m.did = ? AND m.subject = r.did
+                )
+            )`,
+		hostname, knot, ownerDID, ownerDID,
 	).Scan(&n)
 	if err != nil {
 		return false, fmt.Errorf("count repos for knot: %w", err)
@@ -310,16 +321,110 @@ func (s *store) IsKnotWanted(ctx context.Context, hostname, knot string) (bool, 
 	return n > 0, nil
 }
 
+// IsAuthorizedActor reports whether did is the spindle owner or has
+// been authorized by the spindle owner via a sh.tangled.spindle.member
+// record. The membership record's publisher (its `did` column) must
+// equal ownerDID; anyone can publish a membership record naming
+// anyone, so trusting unsigned grants would let any DID grant itself
+// access. This is the same trust rule AuthorizePipelineActor enforces;
+// it's pulled out here so knot-subscription decisions in jetstream.go
+// gate on the same check as pipeline-spawning decisions in knot.go.
+func (s *store) IsAuthorizedActor(ctx context.Context, ownerDID, did string) (bool, error) {
+	if did == "" {
+		return false, nil
+	}
+	if did == ownerDID {
+		return true, nil
+	}
+	var n int
+	err := s.db.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM spindle_members
+          WHERE did = ? AND subject = ?`,
+		ownerDID, did,
+	).Scan(&n)
+	if err != nil {
+		return false, fmt.Errorf("count membership: %w", err)
+	}
+	return n > 0, nil
+}
+
+// GetSpindleMember returns the subject DID currently stored for a
+// (did, rkey) spindle.member row, or "" when no such row exists.
+//
+// Used by the jetstream handler to learn whose authorization a
+// delete/update of a membership record affects, so it can reconcile
+// that subject's knot subscriptions in the same step as the mutation.
+func (s *store) GetSpindleMember(ctx context.Context, did, rkey string) (string, error) {
+	var subject string
+	err := s.db.QueryRowContext(ctx,
+		`SELECT subject FROM spindle_members WHERE did = ? AND rkey = ?`,
+		did, rkey,
+	).Scan(&subject)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", nil
+	}
+	if err != nil {
+		return "", fmt.Errorf("get spindle_member: %w", err)
+	}
+	return subject, nil
+}
+
+// KnotsForOwner returns the distinct knot hostnames of repos published
+// by `did` whose spindle field equals hostname. Used after a membership
+// change to find which knots that DID's repos want, so we can subscribe
+// (newly granted) or potentially unsubscribe (revoked) in lockstep with
+// the grant.
+//
+// Returns an empty slice (not nil) on no matches so callers can range
+// over the result without a nil check.
+func (s *store) KnotsForOwner(ctx context.Context, hostname, did string) ([]string, error) {
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT DISTINCT knot FROM repos
+          WHERE did = ? AND spindle = ? AND knot <> ''`,
+		did, hostname,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("query knots for owner: %w", err)
+	}
+	defer rows.Close()
+	out := []string{}
+	for rows.Next() {
+		var k string
+		if err := rows.Scan(&k); err != nil {
+			return nil, fmt.Errorf("scan knot: %w", err)
+		}
+		out = append(out, k)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate knots: %w", err)
+	}
+	return out, nil
+}
+
 // KnotsForSpindle returns the distinct knot hostnames of all repos that
-// have declared the given spindle hostname as their CI spindle. The knot
-// event-stream subscriber uses this to decide which knots to dial.
+// (a) have declared the given spindle hostname as their CI spindle, and
+// (b) were published by an *authorized* DID: either the spindle owner
+// itself or a member they vouched for via sh.tangled.spindle.member.
+//
+// The membership filter is critical: without it, any DID that publishes
+// a sh.tangled.repo record naming us as its spindle could force us to
+// dial an attacker-chosen knot at startup. See IsAuthorizedActor for
+// the matching trust check applied at firehose-event time.
 //
 // Returns an empty slice (not nil) when nothing matches, so callers can
 // range over the result without a nil check.
-func (s *store) KnotsForSpindle(ctx context.Context, hostname string) ([]string, error) {
+func (s *store) KnotsForSpindle(ctx context.Context, hostname, ownerDID string) ([]string, error) {
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT DISTINCT knot FROM repos WHERE spindle = ? AND knot <> ''`,
-		hostname,
+		`SELECT DISTINCT r.knot FROM repos r
+          WHERE r.spindle = ? AND r.knot <> ''
+            AND (
+                r.did = ?
+                OR EXISTS (
+                    SELECT 1 FROM spindle_members m
+                     WHERE m.did = ? AND m.subject = r.did
+                )
+            )`,
+		hostname, ownerDID, ownerDID,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("query knots: %w", err)

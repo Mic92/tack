@@ -241,36 +241,58 @@ func TestRepoCollaboratorLifecycle(t *testing.T) {
 }
 
 // TestKnotsForSpindle verifies the query returns only knots from repos
-// whose .spindle field matches the given hostname, and that duplicate
-// knots collapse to a single entry.
+// whose .spindle field matches the given hostname *and* whose publisher
+// is an authorized actor (owner or owner-vouched member). Duplicate
+// knots collapse to a single entry. Repos from non-members are excluded:
+// that's the gate that prevents an attacker-published repo record from
+// forcing us to dial an attacker-chosen knot.
 func TestKnotsForSpindle(t *testing.T) {
 	s := newTestStore(t)
 	ctx := context.Background()
 
 	const ours = "tack.example"
 	const other = "other.example"
+	const owner = "did:plc:owner"
 
-	// Two repos on the same knot pointing at us — should collapse to 1.
+	// Vouch for did:plc:a and did:plc:b; did:plc:c is the owner so
+	// no membership grant is needed; did:plc:zzz is unvouched.
+	if err := s.UpsertSpindleMember(ctx, owner, "mk1", ours, "did:plc:a", "t"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.UpsertSpindleMember(ctx, owner, "mk2", ours, "did:plc:b", "t"); err != nil {
+		t.Fatal(err)
+	}
+
+	// Two member-published repos on the same knot pointing at us;
+	// should collapse to one entry.
 	if err := s.UpsertRepo(ctx, "did:plc:a", "rk1", "knot1.example", "repo-a", ours, "", "t"); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.UpsertRepo(ctx, "did:plc:b", "rk2", "knot1.example", "repo-b", ours, "", "t"); err != nil {
 		t.Fatal(err)
 	}
-	// A second knot pointing at us.
-	if err := s.UpsertRepo(ctx, "did:plc:c", "rk3", "knot2.example", "repo-c", ours, "", "t"); err != nil {
+	// Owner-published repo on a second knot. Owner is implicitly
+	// authorized and must be included.
+	if err := s.UpsertRepo(ctx, owner, "rk3", "knot2.example", "repo-c", ours, "", "t"); err != nil {
 		t.Fatal(err)
 	}
-	// A repo pointing at a different spindle — must be excluded.
-	if err := s.UpsertRepo(ctx, "did:plc:d", "rk4", "knot3.example", "repo-d", other, "", "t"); err != nil {
+	// Repo pointing at a different spindle: must be excluded.
+	if err := s.UpsertRepo(ctx, "did:plc:a", "rk4", "knot3.example", "repo-d", other, "", "t"); err != nil {
 		t.Fatal(err)
 	}
-	// A repo with no spindle declared — must be excluded.
-	if err := s.UpsertRepo(ctx, "did:plc:e", "rk5", "knot4.example", "repo-e", "", "", "t"); err != nil {
+	// Repo with no spindle declared: must be excluded.
+	if err := s.UpsertRepo(ctx, "did:plc:a", "rk5", "knot4.example", "repo-e", "", "", "t"); err != nil {
+		t.Fatal(err)
+	}
+	// Repo published by an unvouched DID: must be excluded even
+	// though it points at us. This is the security-relevant case:
+	// without the membership filter, a stranger could pin us to
+	// "evil.example" just by publishing a sh.tangled.repo record.
+	if err := s.UpsertRepo(ctx, "did:plc:zzz", "rk6", "evil.example", "repo-z", ours, "", "t"); err != nil {
 		t.Fatal(err)
 	}
 
-	got, err := s.KnotsForSpindle(ctx, ours)
+	got, err := s.KnotsForSpindle(ctx, ours, owner)
 	if err != nil {
 		t.Fatalf("KnotsForSpindle: %v", err)
 	}
