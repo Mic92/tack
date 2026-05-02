@@ -38,6 +38,14 @@ const (
 	jsOpDelete = "delete"
 )
 
+// jetstreamRewind is how far before the persisted cursor we resume on
+// reconnect. Jetstream's docs recommend rewinding a few seconds because
+// the cursor is a time-based filter and exact-boundary replay is not
+// guaranteed gapless across disconnects. The handler's mutations are
+// idempotent (UPSERTs and DELETEs keyed on (did, rkey)) so the small
+// amount of duplicate replay this introduces is harmless.
+const jetstreamRewind = 5 * time.Second
+
 // startJetstream dials the configured jetstream endpoint and spawns a
 // background goroutine that consumes events for the lifetime of ctx. It
 // returns once the client is constructed; connection errors surface in
@@ -106,8 +114,25 @@ func startJetstream(ctx context.Context, cfg config, st *store, knots KnotConsum
 				logger.Warn("ignoring unreadable cursor; resuming from now", "err", err)
 				cur = nil
 			}
+			// Rewind a few seconds before the saved cursor on reconnect.
+			// Jetstream cursors are time-based and the docs explicitly note
+			// that exact-boundary replay is not guaranteed gapless, so a
+			// small negative buffer protects against missing events that
+			// straddle the disconnect. Duplicates the rewind produces are
+			// safe: every applyCommit path is an idempotent upsert/delete
+			// keyed on (did, rkey), and SaveCursor only moves forward in
+			// practice because TimeUS is monotonic.
 			if cur != nil {
-				logger.Info("connecting to jetstream", "cursor_us", *cur)
+				rewound := *cur - int64(jetstreamRewind/time.Microsecond)
+				if rewound < 0 {
+					rewound = 0
+				}
+				logger.Info("connecting to jetstream",
+					"cursor_us", *cur,
+					"rewound_us", rewound,
+					"rewind", jetstreamRewind,
+				)
+				cur = &rewound
 			} else {
 				logger.Info("connecting to jetstream from now (no cursor)")
 			}
