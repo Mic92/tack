@@ -12,6 +12,7 @@ import (
 	"context"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 // newTestStore opens a fresh store in a per-test temp dir and registers
@@ -281,6 +282,99 @@ func TestKnotsForSpindle(t *testing.T) {
 		if _, ok := want[k]; !ok {
 			t.Fatalf("unexpected knot %q in %v", k, got)
 		}
+	}
+}
+
+// TestLookupBuildkiteBuildByTuplePicksMostRecent verifies that
+// LookupBuildkiteBuildByTuple returns the build with the largest
+// created_unix_ns even when text-ordering created_at would lie.
+//
+// The motivating bug: time.Format(RFC3339Nano) trims trailing zeros,
+// so an exact-second instant renders as "...:00Z" while one nanosecond
+// later renders as "...:00.000000001Z". Lex ordering puts ".000000001Z"
+// *before* "Z" because '.' (0x2E) < 'Z' (0x5A), so ORDER BY created_at
+// DESC would surface the *earlier* row as the latest build. Sorting
+// on created_unix_ns avoids that and is what /logs depends on to
+// resolve the right run.
+func TestLookupBuildkiteBuildByTuplePicksMostRecent(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+
+	// Two rows for the same (knot, rkey, workflow). The "newer" one
+	// is one nanosecond later but its RFC3339Nano text sorts BEFORE
+	// the older row's, which is exactly the failure mode we're
+	// guarding against.
+	older := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	newer := older.Add(time.Nanosecond)
+
+	insert := func(uuid string, ts time.Time) {
+		t.Helper()
+		_, err := s.db.ExecContext(ctx,
+			`INSERT INTO buildkite_builds (
+                build_uuid, build_number, pipeline_slug, org,
+                knot, pipeline_rkey, workflow,
+                pipeline_uri, created_at, created_unix_ns
+             ) VALUES (?, ?, ?, '', ?, ?, ?, ?, ?, ?)`,
+			uuid, int64(1), "p",
+			"k", "r", "w", "at://x",
+			ts.Format(time.RFC3339Nano), ts.UnixNano(),
+		)
+		if err != nil {
+			t.Fatalf("insert %s: %v", uuid, err)
+		}
+	}
+	insert("older", older)
+	insert("newer", newer)
+
+	ref, err := s.LookupBuildkiteBuildByTuple(ctx, "k", "r", "w")
+	if err != nil {
+		t.Fatalf("lookup: %v", err)
+	}
+	if ref == nil {
+		t.Fatal("lookup returned nil; want a row")
+	}
+	if ref.BuildUUID != "newer" {
+		t.Fatalf("lookup picked %q; want %q (text-ordering bug regression)",
+			ref.BuildUUID, "newer")
+	}
+}
+
+// TestBuildkiteCreatedUnixNSBackfill simulates the upgrade path: rows
+// inserted before the column existed (created_unix_ns = 0) get
+// promoted to the parsed UnixNano of their created_at by the migration.
+// Without the backfill the lookup would tie on 0 across all legacy
+// rows and have to fall back to the (still-imperfect) text ordering.
+func TestBuildkiteCreatedUnixNSBackfill(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+
+	// Pretend this row was written by an older binary: created_at
+	// is set, created_unix_ns is the post-ALTER default 0.
+	want := time.Date(2026, 3, 4, 5, 6, 7, 8, time.UTC)
+	if _, err := s.db.ExecContext(ctx,
+		`INSERT INTO buildkite_builds (
+            build_uuid, build_number, pipeline_slug, org,
+            knot, pipeline_rkey, workflow,
+            pipeline_uri, created_at, created_unix_ns
+         ) VALUES (?, 1, 'p', '', 'k', 'r', 'w', 'at://x', ?, 0)`,
+		"legacy", want.Format(time.RFC3339Nano),
+	); err != nil {
+		t.Fatalf("seed legacy row: %v", err)
+	}
+
+	if err := s.backfillBuildkiteCreatedUnixNS(ctx); err != nil {
+		t.Fatalf("backfill: %v", err)
+	}
+
+	var got int64
+	if err := s.db.QueryRowContext(ctx,
+		`SELECT created_unix_ns FROM buildkite_builds WHERE build_uuid = ?`,
+		"legacy",
+	).Scan(&got); err != nil {
+		t.Fatalf("read back: %v", err)
+	}
+	if got != want.UnixNano() {
+		t.Fatalf("created_unix_ns = %d; want %d", got, want.UnixNano())
 	}
 }
 

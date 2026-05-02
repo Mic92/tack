@@ -352,24 +352,31 @@ type BuildkiteBuildRef struct {
 // Buildkite-side rebuild that re-fires us) just refreshes the row
 // instead of failing.
 func (s *store) InsertBuildkiteBuild(ctx context.Context, ref BuildkiteBuildRef) error {
+	// Capture wall-clock and monotonic-friendly forms once so the two
+	// columns agree on the same instant. created_at is the
+	// human-readable RFC3339Nano string; created_unix_ns is the
+	// integer the lookup orders on (text comparison of nanosecond
+	// timestamps isn't reliable, so we sort on the int instead).
+	now := time.Now().UTC()
 	_, err := s.db.ExecContext(ctx,
 		`INSERT INTO buildkite_builds (
             build_uuid, build_number, pipeline_slug, org,
             knot, pipeline_rkey, workflow,
-            pipeline_uri, created_at
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            pipeline_uri, created_at, created_unix_ns
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(build_uuid) DO UPDATE SET
-             build_number  = excluded.build_number,
-             pipeline_slug = excluded.pipeline_slug,
-             org           = excluded.org,
-             knot          = excluded.knot,
-             pipeline_rkey = excluded.pipeline_rkey,
-             workflow      = excluded.workflow,
-             pipeline_uri  = excluded.pipeline_uri,
-             created_at    = excluded.created_at`,
+             build_number    = excluded.build_number,
+             pipeline_slug   = excluded.pipeline_slug,
+             org             = excluded.org,
+             knot            = excluded.knot,
+             pipeline_rkey   = excluded.pipeline_rkey,
+             workflow        = excluded.workflow,
+             pipeline_uri    = excluded.pipeline_uri,
+             created_at      = excluded.created_at,
+             created_unix_ns = excluded.created_unix_ns`,
 		ref.BuildUUID, ref.BuildNumber, ref.PipelineSlug, ref.Org,
 		ref.Knot, ref.PipelineRkey, ref.Workflow,
-		ref.PipelineURI, time.Now().UTC().Format(time.RFC3339Nano),
+		ref.PipelineURI, now.Format(time.RFC3339Nano), now.UnixNano(),
 	)
 	if err != nil {
 		return fmt.Errorf("insert buildkite_build: %w", err)
@@ -411,6 +418,13 @@ func (s *store) LookupBuildkiteBuildByUUID(ctx context.Context, buildUUID string
 // over time (rebuilds, re-triggers). We always serve logs for the
 // latest run; older runs are still queryable by build UUID directly
 // if anyone ever wants that.
+//
+// Ordering is on created_unix_ns (a monotonic int) rather than
+// created_at. Text comparison of RFC3339Nano timestamps is not
+// reliable across nanosecond precision, which used to make this
+// query occasionally pick the wrong run. created_at and build_number
+// are kept as deterministic tiebreakers for legacy rows that pre-date
+// the new column and still scan as 0.
 func (s *store) LookupBuildkiteBuildByTuple(ctx context.Context, knot, pipelineRkey, workflow string) (*BuildkiteBuildRef, error) {
 	var ref BuildkiteBuildRef
 	err := s.db.QueryRowContext(ctx,
@@ -418,7 +432,7 @@ func (s *store) LookupBuildkiteBuildByTuple(ctx context.Context, knot, pipelineR
                 knot, pipeline_rkey, workflow, pipeline_uri
            FROM buildkite_builds
           WHERE knot = ? AND pipeline_rkey = ? AND workflow = ?
-          ORDER BY created_at DESC
+          ORDER BY created_unix_ns DESC, created_at DESC, build_number DESC
           LIMIT 1`,
 		knot, pipelineRkey, workflow,
 	).Scan(
