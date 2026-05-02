@@ -171,7 +171,7 @@ func TestBuildkiteSpawnWorkflowConfig(t *testing.T) {
 		w.WriteHeader(http.StatusCreated)
 		_ = json.NewEncoder(w).Encode(buildkite.Build{ID: "uuid-9", Number: 9})
 	})
-	p, _, _, _ := newBuildkiteTestProvider(t, buildkite.WebhookModeToken, "s", bk)
+	p, st, _, _ := newBuildkiteTestProvider(t, buildkite.WebhookModeToken, "s", bk)
 
 	raw := strings.Join([]string{
 		"tack:",
@@ -222,6 +222,34 @@ func TestBuildkiteSpawnWorkflowConfig(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("CreateBuild not called")
+	}
+
+	// The workflow's `org` override has to round-trip through
+	// the store: /logs (and any future post-creation API call)
+	// looks the row up by tuple and re-issues calls against the
+	// org we recorded here. If we drop it, log retrieval falls
+	// back to defaultOrg and 404s for cross-org workflows.
+	deadline := time.Now().Add(2 * time.Second)
+	var ref *BuildkiteBuildRef
+	for time.Now().Before(deadline) {
+		var err error
+		ref, err = st.LookupBuildkiteBuildByTuple(
+			context.Background(),
+			"knot.example.com", "rkey-x", "ci.yml",
+		)
+		if err != nil {
+			t.Fatalf("lookup: %v", err)
+		}
+		if ref != nil {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if ref == nil {
+		t.Fatal("buildkite build row not persisted within deadline")
+	}
+	if ref.Org != "workflow-org" {
+		t.Fatalf("ref.Org = %q; want %q", ref.Org, "workflow-org")
 	}
 }
 

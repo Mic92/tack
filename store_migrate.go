@@ -7,6 +7,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"strings"
 )
 
 // schema is the full set of CREATE statements applied at startup. It is
@@ -92,10 +93,18 @@ CREATE TABLE IF NOT EXISTS events (
 --
 -- The (knot, pipeline_rkey, workflow) index supports the /logs
 -- handler, which only knows that tuple at request time.
+-- org is the Buildkite organisation slug the build was created
+-- against. A workflow's YAML can override the spindle's default
+-- org via tack.buildkite.org, so we persist whatever was used at
+-- Spawn time and read it back when fetching jobs/logs. The empty
+-- string means "use the provider's defaultOrg" — that's both the
+-- usual single-org case and what every row written before this
+-- column existed will scan as.
 CREATE TABLE IF NOT EXISTS buildkite_builds (
     build_uuid     TEXT PRIMARY KEY,
     build_number   INTEGER NOT NULL,
     pipeline_slug  TEXT NOT NULL,
+    org            TEXT NOT NULL DEFAULT '',
     knot           TEXT NOT NULL,
     pipeline_rkey  TEXT NOT NULL,
     workflow       TEXT NOT NULL,
@@ -107,9 +116,30 @@ CREATE INDEX IF NOT EXISTS buildkite_builds_lookup
 `
 
 // migrate applies the schema. Safe to call repeatedly.
+//
+// CREATE TABLE IF NOT EXISTS is enough for fresh databases, but it
+// won't widen an already-existing table. Columns added after the
+// initial release therefore need a parallel ALTER TABLE step here;
+// SQLite has no `ADD COLUMN IF NOT EXISTS`, so we run the ALTER and
+// swallow the "duplicate column" error that fires on subsequent
+// startups. Anything else is fatal.
 func (s *store) migrate(ctx context.Context) error {
 	if _, err := s.db.ExecContext(ctx, schema); err != nil {
 		return fmt.Errorf("apply schema: %w", err)
+	}
+	for _, alter := range []string{
+		// Persist the Buildkite org each build was created
+		// against so /logs can target the same org the workflow
+		// chose. Pre-existing rows scan as empty string, which
+		// the provider treats as "use defaultOrg".
+		`ALTER TABLE buildkite_builds ADD COLUMN org TEXT NOT NULL DEFAULT ''`,
+	} {
+		if _, err := s.db.ExecContext(ctx, alter); err != nil {
+			if strings.Contains(err.Error(), "duplicate column name") {
+				continue
+			}
+			return fmt.Errorf("apply alter %q: %w", alter, err)
+		}
 	}
 	return nil
 }

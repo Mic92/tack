@@ -329,13 +329,21 @@ func (s *store) InsertEvent(ctx context.Context, rkey, nsid string, eventJSON []
 // and the /logs handler (by knot+rkey+workflow) when an appview
 // client asks for output.
 type BuildkiteBuildRef struct {
-	BuildUUID     string
-	BuildNumber   int64
-	PipelineSlug  string
-	Knot          string
-	PipelineRkey  string
-	Workflow      string
-	PipelineURI   string
+	BuildUUID    string
+	BuildNumber  int64
+	PipelineSlug string
+	// Org is the Buildkite organisation slug the build was created
+	// against. Persisted at Spawn time so /logs and any other
+	// post-creation API call can target the same org the workflow
+	// originally chose — see the workflow YAML `tack.buildkite.org`
+	// override. Empty means "use the provider's default org", which
+	// is what every row written before the org column existed will
+	// scan as.
+	Org          string
+	Knot         string
+	PipelineRkey string
+	Workflow     string
+	PipelineURI  string
 }
 
 // InsertBuildkiteBuild records that a Buildkite build was created on
@@ -346,19 +354,20 @@ type BuildkiteBuildRef struct {
 func (s *store) InsertBuildkiteBuild(ctx context.Context, ref BuildkiteBuildRef) error {
 	_, err := s.db.ExecContext(ctx,
 		`INSERT INTO buildkite_builds (
-            build_uuid, build_number, pipeline_slug,
+            build_uuid, build_number, pipeline_slug, org,
             knot, pipeline_rkey, workflow,
             pipeline_uri, created_at
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(build_uuid) DO UPDATE SET
              build_number  = excluded.build_number,
              pipeline_slug = excluded.pipeline_slug,
+             org           = excluded.org,
              knot          = excluded.knot,
              pipeline_rkey = excluded.pipeline_rkey,
              workflow      = excluded.workflow,
              pipeline_uri  = excluded.pipeline_uri,
              created_at    = excluded.created_at`,
-		ref.BuildUUID, ref.BuildNumber, ref.PipelineSlug,
+		ref.BuildUUID, ref.BuildNumber, ref.PipelineSlug, ref.Org,
 		ref.Knot, ref.PipelineRkey, ref.Workflow,
 		ref.PipelineURI, time.Now().UTC().Format(time.RFC3339Nano),
 	)
@@ -376,12 +385,12 @@ func (s *store) InsertBuildkiteBuild(ctx context.Context, ref BuildkiteBuildRef)
 func (s *store) LookupBuildkiteBuildByUUID(ctx context.Context, buildUUID string) (*BuildkiteBuildRef, error) {
 	var ref BuildkiteBuildRef
 	err := s.db.QueryRowContext(ctx,
-		`SELECT build_uuid, build_number, pipeline_slug,
+		`SELECT build_uuid, build_number, pipeline_slug, org,
                 knot, pipeline_rkey, workflow, pipeline_uri
            FROM buildkite_builds WHERE build_uuid = ?`,
 		buildUUID,
 	).Scan(
-		&ref.BuildUUID, &ref.BuildNumber, &ref.PipelineSlug,
+		&ref.BuildUUID, &ref.BuildNumber, &ref.PipelineSlug, &ref.Org,
 		&ref.Knot, &ref.PipelineRkey, &ref.Workflow, &ref.PipelineURI,
 	)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -405,7 +414,7 @@ func (s *store) LookupBuildkiteBuildByUUID(ctx context.Context, buildUUID string
 func (s *store) LookupBuildkiteBuildByTuple(ctx context.Context, knot, pipelineRkey, workflow string) (*BuildkiteBuildRef, error) {
 	var ref BuildkiteBuildRef
 	err := s.db.QueryRowContext(ctx,
-		`SELECT build_uuid, build_number, pipeline_slug,
+		`SELECT build_uuid, build_number, pipeline_slug, org,
                 knot, pipeline_rkey, workflow, pipeline_uri
            FROM buildkite_builds
           WHERE knot = ? AND pipeline_rkey = ? AND workflow = ?
@@ -413,7 +422,7 @@ func (s *store) LookupBuildkiteBuildByTuple(ctx context.Context, knot, pipelineR
           LIMIT 1`,
 		knot, pipelineRkey, workflow,
 	).Scan(
-		&ref.BuildUUID, &ref.BuildNumber, &ref.PipelineSlug,
+		&ref.BuildUUID, &ref.BuildNumber, &ref.PipelineSlug, &ref.Org,
 		&ref.Knot, &ref.PipelineRkey, &ref.Workflow, &ref.PipelineURI,
 	)
 	if errors.Is(err, sql.ErrNoRows) {

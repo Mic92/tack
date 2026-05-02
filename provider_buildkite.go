@@ -259,10 +259,16 @@ func (p *buildkiteProvider) spawnWorkflow(
 	)
 
 	pipelineURI := pipelineATURI(knot, pipelineRkey)
+	// Persist the org we actually used. cfg.Org (not the resolved
+	// `org`) is intentional: empty means "fall back to defaultOrg
+	// at read time", which keeps the row meaningful even if the
+	// provider's defaultOrg changes later — and matches what older
+	// rows scan as before this column existed.
 	if err := p.st.InsertBuildkiteBuild(ctx, BuildkiteBuildRef{
 		BuildUUID:    build.ID,
 		BuildNumber:  build.Number,
 		PipelineSlug: cfg.Pipeline,
+		Org:          cfg.Org,
 		Knot:         knot,
 		PipelineRkey: pipelineRkey,
 		Workflow:     wf.Name,
@@ -377,13 +383,16 @@ func (p *buildkiteProvider) Logs(
 		return nil, ErrLogsNotFound
 	}
 
-	// Resolve the org against which we should pull jobs/logs. We
-	// don't persist it on BuildkiteBuildRef today (the slug + token
-	// have always been enough); fall back to the provider default,
-	// which is correct for the common single-org install. A
-	// future migration can add a column when multi-org installs
-	// need it.
-	org := p.defaultOrg
+	// Resolve the org against which we should pull jobs/logs. The
+	// workflow YAML can override the spindle's default at Spawn
+	// time (tack.buildkite.org), so we honour whatever the row
+	// recorded; an empty value means the workflow didn't override,
+	// which is the same as "use defaultOrg" — including for rows
+	// written before the org column was added.
+	org := ref.Org
+	if org == "" {
+		org = p.defaultOrg
+	}
 
 	build, err := p.client.GetBuild(ctx, org, ref.PipelineSlug, ref.BuildNumber)
 	if err != nil {
