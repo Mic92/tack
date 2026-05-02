@@ -32,6 +32,7 @@ import (
 
 	"tangled.org/core/api/tangled"
 	"tangled.org/core/eventconsumer"
+	"tangled.org/core/eventconsumer/cursor"
 )
 
 // KnotConsumer is the surface area the rest of tack uses to interact
@@ -90,11 +91,14 @@ var _ KnotConsumer = (*knotConsumer)(nil)
 // background, and returns the wrapper. The consumer keeps running until
 // ctx is cancelled.
 //
-// Cursor persistence is intentionally in-memory for now: we only log
-// events, so re-receiving a few seconds of pipeline triggers after a
-// restart is harmless. When we start translating triggers into real
-// Buildkite builds, this should switch to a SQLite-backed cursor store
-// to avoid duplicate builds.
+// Cursor persistence is backed by tangled-core's SQLite cursor store
+// pointed at the same database file as the rest of tack. Without
+// this, a restart would replay every recent pipeline event from each
+// knot and fire a duplicate Buildkite build for each one. The
+// cursor.SqliteStore opens its own *sql.DB on the file, but
+// mattn/go-sqlite3 in WAL mode tolerates concurrent connections, and
+// the `cursors` table the upstream package creates doesn't collide
+// with any of our migrations.
 func startKnotConsumer(ctx context.Context, cfg config, st *store, provider Provider) (*knotConsumer, error) {
 	logger := loggerFrom(ctx).With("component", "knotconsumer")
 
@@ -103,12 +107,22 @@ func startKnotConsumer(ctx context.Context, cfg config, st *store, provider Prov
 		return nil, fmt.Errorf("load known knots: %w", err)
 	}
 
+	// Persistent per-source cursor store. Keyed by source.Key() (the
+	// knot hostname for KnotSource), so each knot resumes exactly
+	// where it left off and we don't re-fire builds for events that
+	// were already processed before the previous shutdown.
+	cursorStore, err := cursor.NewSQLiteStore(cfg.DBPath)
+	if err != nil {
+		return nil, fmt.Errorf("open knot cursor store: %w", err)
+	}
+
 	kc := &knotConsumer{log: logger, provider: provider}
 
 	ccfg := eventconsumer.NewConsumerConfig()
 	ccfg.Logger = logger
 	ccfg.Dev = cfg.Dev
 	ccfg.ProcessFunc = kc.process
+	ccfg.CursorStore = cursorStore
 	for _, k := range knots {
 		ccfg.Sources[eventconsumer.NewKnotSource(k)] = struct{}{}
 		logger.Info("seeding knot source", "knot", k)
