@@ -46,6 +46,12 @@ type config struct {
 	BuildkiteOrg           string
 	BuildkiteWebhookSecret string
 	BuildkiteWebhookMode   buildkite.WebhookMode
+
+	// Tekton mode is explicit because it only works from inside a
+	// Kubernetes cluster. When enabled, tack creates PipelineRuns in
+	// TektonNamespace using its pod's service account credentials.
+	TektonEnabled   bool
+	TektonNamespace string
 }
 
 func loadConfig() (config, error) {
@@ -62,6 +68,8 @@ func loadConfig() (config, error) {
 		BuildkiteWebhookMode: buildkite.WebhookMode(
 			envOr("TACK_BUILDKITE_WEBHOOK_MODE", string(buildkite.WebhookModeToken)),
 		),
+		TektonEnabled:   os.Getenv("TACK_TEKTON_ENABLED") == "1",
+		TektonNamespace: envOr("TACK_TEKTON_NAMESPACE", "default"),
 	}
 	addrFlag := flag.String("addr", cfg.Addr, "HTTP listen address (overrides TACK_LISTEN_ADDR)")
 	flag.Parse()
@@ -99,6 +107,9 @@ func loadConfig() (config, error) {
 				cfg.BuildkiteWebhookMode,
 			)
 		}
+	}
+	if cfg.TektonEnabled && cfg.TektonNamespace == "" {
+		return cfg, errors.New("TACK_TEKTON_NAMESPACE is required when TACK_TEKTON_ENABLED=1")
 	}
 
 	return cfg, nil
@@ -189,6 +200,21 @@ func main() {
 		logger.Info("buildkite provider enabled",
 			"default_org", cfg.BuildkiteOrg,
 			"webhook_mode", cfg.BuildkiteWebhookMode,
+		)
+	}
+	if cfg.TektonEnabled {
+		tkProvider, err := newInClusterTektonProvider(
+			br, st,
+			cfg.TektonNamespace,
+			logger,
+		)
+		if err != nil {
+			logger.Error("failed to configure tekton provider", "err", err)
+			os.Exit(1)
+		}
+		providers["tekton"] = tkProvider
+		logger.Info("tekton provider enabled",
+			"namespace", cfg.TektonNamespace,
 		)
 	}
 	provider := newProviderRouter(logger, providers)

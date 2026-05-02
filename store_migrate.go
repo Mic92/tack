@@ -121,6 +121,27 @@ CREATE TABLE IF NOT EXISTS buildkite_builds (
 );
 CREATE INDEX IF NOT EXISTS buildkite_builds_lookup
     ON buildkite_builds (knot, pipeline_rkey, workflow);
+
+-- Mapping from a Tangled workflow tuple to the latest Tekton
+-- PipelineRun tack created for it. Unlike Buildkite webhooks, Tekton
+-- status observation happens in-process, so the primary read path is
+-- /logs resolving (knot, pipeline_rkey, workflow) back to the concrete
+-- PipelineRun whose TaskRuns and pods hold output.
+CREATE TABLE IF NOT EXISTS tekton_runs (
+    knot              TEXT NOT NULL,
+    pipeline_rkey     TEXT NOT NULL,
+    workflow          TEXT NOT NULL,
+    namespace         TEXT NOT NULL,
+    pipeline_run_name TEXT NOT NULL,
+    pipeline_run_uid  TEXT NOT NULL,
+    pipeline_name     TEXT NOT NULL,
+    pipeline_uri      TEXT NOT NULL,
+    created_at        TEXT NOT NULL,
+    created_unix_ns   INTEGER NOT NULL,
+    PRIMARY KEY (knot, pipeline_rkey, workflow)
+);
+CREATE INDEX IF NOT EXISTS tekton_runs_uid
+    ON tekton_runs (pipeline_run_uid);
 `
 
 // migrate applies the schema. Safe to call repeatedly.

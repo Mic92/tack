@@ -110,3 +110,4 @@ provider's tack env vars, and the workflow YAML schema) lives in
 its own doc per provider:
 
 * [Buildkite](docs/buildkite.md)
+* [Tekton](docs/tekton.md)

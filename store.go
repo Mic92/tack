@@ -526,6 +526,21 @@ type BuildkiteBuildRef struct {
 	PipelineURI  string
 }
 
+// TektonRunRef is the persisted link from a Tangled workflow tuple
+// to the in-cluster PipelineRun tack created for it. The tuple is the
+// user-facing identity the appview knows; namespace/name/uid are the
+// Kubernetes identity needed for status watching and log lookup.
+type TektonRunRef struct {
+	Knot            string
+	PipelineRkey    string
+	Workflow        string
+	Namespace       string
+	PipelineRunName string
+	PipelineRunUID  string
+	PipelineName    string
+	PipelineURI     string
+}
+
 // InsertBuildkiteBuild records that a Buildkite build was created on
 // behalf of the given (knot, pipelineRkey, workflow) tuple. Uses
 // INSERT OR REPLACE so that an unlikely build-uuid collision (or a
@@ -624,6 +639,60 @@ func (s *store) LookupBuildkiteBuildByTuple(ctx context.Context, knot, pipelineR
 	}
 	if err != nil {
 		return nil, fmt.Errorf("lookup buildkite_build by tuple: %w", err)
+	}
+	return &ref, nil
+}
+
+// InsertTektonRun records the latest PipelineRun created for a Tangled
+// workflow tuple. Reusing the tuple as the primary key intentionally
+// makes /logs resolve to the newest run for that workflow identity.
+func (s *store) InsertTektonRun(ctx context.Context, ref TektonRunRef) error {
+	now := time.Now().UTC()
+	_, err := s.db.ExecContext(ctx,
+		`INSERT INTO tekton_runs (
+            knot, pipeline_rkey, workflow,
+            namespace, pipeline_run_name, pipeline_run_uid,
+            pipeline_name, pipeline_uri, created_at, created_unix_ns
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(knot, pipeline_rkey, workflow) DO UPDATE SET
+             namespace         = excluded.namespace,
+             pipeline_run_name = excluded.pipeline_run_name,
+             pipeline_run_uid  = excluded.pipeline_run_uid,
+             pipeline_name     = excluded.pipeline_name,
+             pipeline_uri      = excluded.pipeline_uri,
+             created_at        = excluded.created_at,
+             created_unix_ns   = excluded.created_unix_ns`,
+		ref.Knot, ref.PipelineRkey, ref.Workflow,
+		ref.Namespace, ref.PipelineRunName, ref.PipelineRunUID,
+		ref.PipelineName, ref.PipelineURI, now.Format(time.RFC3339Nano), now.UnixNano(),
+	)
+	if err != nil {
+		return fmt.Errorf("insert tekton_run: %w", err)
+	}
+	return nil
+}
+
+// LookupTektonRunByTuple resolves the appview's path-based identity to
+// the concrete PipelineRun tack created in Kubernetes.
+func (s *store) LookupTektonRunByTuple(ctx context.Context, knot, pipelineRkey, workflow string) (*TektonRunRef, error) {
+	var ref TektonRunRef
+	err := s.db.QueryRowContext(ctx,
+		`SELECT knot, pipeline_rkey, workflow,
+                namespace, pipeline_run_name, pipeline_run_uid,
+                pipeline_name, pipeline_uri
+           FROM tekton_runs
+          WHERE knot = ? AND pipeline_rkey = ? AND workflow = ?`,
+		knot, pipelineRkey, workflow,
+	).Scan(
+		&ref.Knot, &ref.PipelineRkey, &ref.Workflow,
+		&ref.Namespace, &ref.PipelineRunName, &ref.PipelineRunUID,
+		&ref.PipelineName, &ref.PipelineURI,
+	)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("lookup tekton_run by tuple: %w", err)
 	}
 	return &ref, nil
 }
