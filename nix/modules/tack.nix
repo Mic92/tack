@@ -98,6 +98,29 @@ in
           don't get baked into the world-readable Nix store.
         '';
       };
+
+      # Escape hatch for arbitrary systemd `[Service]` settings (e.g.
+      # `MemoryMax`, `CPUQuota`, additional sandboxing knobs). These
+      # are merged into `serviceConfig` and override the defaults
+      # below on conflict, so callers can both add new settings and
+      # tweak the ones we set out of the box.
+      extraServiceConfig = mkOption {
+        type = types.attrsOf types.unspecified;
+        default = {};
+        example = literalExpression ''
+          {
+            MemoryMax = "512M";
+            CPUQuota = "50%";
+          }
+        '';
+        description = ''
+          Extra settings merged into the systemd service's
+          `[Service]` section. See {manpage}`systemd.exec(5)` and
+          {manpage}`systemd.resource-control(5)` for available
+          options. Values here take precedence over the module's
+          defaults.
+        '';
+      };
     };
 
     config = mkIf cfg.enable {
@@ -106,48 +129,52 @@ in
         after = ["network.target"];
         wantedBy = ["multi-user.target"];
 
-        serviceConfig = {
-          # StateDirectory creates /var/lib/tack with the right
-          # ownership; the default dbPath lives there.
-          StateDirectory = "tack";
-          LogsDirectory = "tack";
-          EnvironmentFile = mkIf (cfg.environmentFile != null) cfg.environmentFile;
+        # `extraServiceConfig` is merged in last so user-supplied
+        # settings override our defaults on conflict.
+        serviceConfig =
+          {
+            # StateDirectory creates /var/lib/tack with the right
+            # ownership; the default dbPath lives there.
+            StateDirectory = "tack";
+            LogsDirectory = "tack";
+            EnvironmentFile = mkIf (cfg.environmentFile != null) cfg.environmentFile;
 
-          # Only the non-secret env vars go inline here. Anything
-          # sensitive (token, webhook secret) must come from
-          # `environmentFile` to stay out of the Nix store.
-          Environment =
-            [
-              "TACK_LISTEN_ADDR=${cfg.listenAddr}"
-              "TACK_HOSTNAME=${cfg.hostname}"
-              "TACK_OWNER_DID=${cfg.ownerDid}"
-              "TACK_DB_PATH=${cfg.dbPath}"
-              "TACK_JETSTREAM_URL=${cfg.jetstreamUrl}"
-              "TACK_BUILDKITE_WEBHOOK_MODE=${cfg.buildkite.webhookMode}"
-            ]
-            ++ optional cfg.dev "TACK_DEV=1"
-            ++ optional (cfg.buildkite.org != null)
-            "TACK_BUILDKITE_ORG=${cfg.buildkite.org}";
+            # Only the non-secret env vars go inline here. Anything
+            # sensitive (token, webhook secret) must come from
+            # `environmentFile` to stay out of the Nix store.
+            Environment =
+              [
+                "TACK_LISTEN_ADDR=${cfg.listenAddr}"
+                "TACK_HOSTNAME=${cfg.hostname}"
+                "TACK_OWNER_DID=${cfg.ownerDid}"
+                "TACK_DB_PATH=${cfg.dbPath}"
+                "TACK_JETSTREAM_URL=${cfg.jetstreamUrl}"
+                "TACK_BUILDKITE_WEBHOOK_MODE=${cfg.buildkite.webhookMode}"
+              ]
+              ++ optional cfg.dev "TACK_DEV=1"
+              ++ optional (cfg.buildkite.org != null)
+              "TACK_BUILDKITE_ORG=${cfg.buildkite.org}";
 
-          ExecStart = "${cfg.package}/bin/tack -addr ${cfg.listenAddr}";
-          Restart = "always";
+            ExecStart = "${cfg.package}/bin/tack -addr ${cfg.listenAddr}";
+            Restart = "always";
 
-          # Light hardening. Tack only needs network access plus its
-          # state directory, so we lock the rest down.
-          DynamicUser = true;
-          NoNewPrivileges = true;
-          ProtectSystem = "strict";
-          ProtectHome = true;
-          PrivateTmp = true;
-          PrivateDevices = true;
-          ProtectKernelTunables = true;
-          ProtectKernelModules = true;
-          ProtectControlGroups = true;
-          RestrictAddressFamilies = ["AF_INET" "AF_INET6" "AF_UNIX"];
-          RestrictNamespaces = true;
-          LockPersonality = true;
-          MemoryDenyWriteExecute = true;
-        };
+            # Light hardening. Tack only needs network access plus its
+            # state directory, so we lock the rest down.
+            DynamicUser = true;
+            NoNewPrivileges = true;
+            ProtectSystem = "strict";
+            ProtectHome = true;
+            PrivateTmp = true;
+            PrivateDevices = true;
+            ProtectKernelTunables = true;
+            ProtectKernelModules = true;
+            ProtectControlGroups = true;
+            RestrictAddressFamilies = ["AF_INET" "AF_INET6" "AF_UNIX"];
+            RestrictNamespaces = true;
+            LockPersonality = true;
+            MemoryDenyWriteExecute = true;
+          }
+          // cfg.extraServiceConfig;
       };
     };
   }
