@@ -29,6 +29,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"time"
 
 	"tangled.org/core/api/tangled"
 	"tangled.org/core/eventconsumer"
@@ -75,6 +76,12 @@ type knotConsumer struct {
 	c   *eventconsumer.Consumer
 	log *slog.Logger
 
+	// cursors is the persistent cursor store the underlying consumer
+	// reads at every (re)connect. We retain a reference here so we
+	// can pre-seed an entry to "now" the first time we ever see a
+	// knot — see seedCursorIfMissing for why.
+	cursors cursor.Store
+
 	// provider dispatches each incoming pipeline trigger to whatever
 	// backend actually runs it (today: the fake provider; tomorrow:
 	// Buildkite). The consumer doesn't care which — it just hands
@@ -116,7 +123,7 @@ func startKnotConsumer(ctx context.Context, cfg config, st *store, provider Prov
 		return nil, fmt.Errorf("open knot cursor store: %w", err)
 	}
 
-	kc := &knotConsumer{log: logger, provider: provider}
+	kc := &knotConsumer{log: logger, cursors: cursorStore, provider: provider}
 
 	ccfg := eventconsumer.NewConsumerConfig()
 	ccfg.Logger = logger
@@ -124,6 +131,11 @@ func startKnotConsumer(ctx context.Context, cfg config, st *store, provider Prov
 	ccfg.ProcessFunc = kc.process
 	ccfg.CursorStore = cursorStore
 	for _, k := range knots {
+		// Pin a brand-new knot's cursor to "now" before the consumer
+		// ever connects, so a fresh tack install doesn't replay every
+		// historical pipeline event the knot has retained and fire a
+		// duplicate Buildkite build for each one.
+		kc.seedCursorIfMissing(k)
 		ccfg.Sources[eventconsumer.NewKnotSource(k)] = struct{}{}
 		logger.Info("seeding knot source", "knot", k)
 	}
@@ -145,8 +157,41 @@ func (k *knotConsumer) AddKnot(ctx context.Context, knot string) {
 	if knot == "" {
 		return
 	}
+	// Same first-run protection as in startKnotConsumer: a knot we
+	// have never observed before must not retroactively fire
+	// pipelines for triggers older than the moment we learned about
+	// it. AddSource reads the cursor synchronously when it dials.
+	k.seedCursorIfMissing(knot)
 	k.log.Info("adding knot source", "knot", knot)
 	k.c.AddSource(ctx, eventconsumer.NewKnotSource(knot))
+}
+
+// seedCursorIfMissing writes the current time (as nanoseconds since
+// the unix epoch, the same unit eventconsumer.worker uses when it
+// advances cursors after each message) to the cursor store for knot
+// iff no cursor is already persisted for it.
+//
+// Without this, a brand-new install — or the first time we ever
+// dial a previously-unseen knot — connects to /events with no
+// cursor query parameter, which the knot servers interpret as
+// "stream from the beginning of time." For pipeline records that
+// would fire one Buildkite build per historical trigger the knot
+// still has retained. Pinning the cursor up-front limits us to
+// events that arrive *after* tack learned about the knot.
+//
+// Get returning 0 means "no cursor stored" across all the cursor
+// store implementations we use (memory/sqlite/redis), so it's a
+// safe sentinel to gate the write.
+func (k *knotConsumer) seedCursorIfMissing(knot string) {
+	if k.cursors.Get(knot) != 0 {
+		return
+	}
+	now := time.Now().UnixNano()
+	k.cursors.Set(knot, now)
+	k.log.Info("seeded fresh knot cursor to now",
+		"knot", knot,
+		"cursor", now,
+	)
 }
 
 // RemoveKnot is currently a no-op — see the interface comment for the
