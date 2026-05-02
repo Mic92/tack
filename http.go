@@ -91,16 +91,21 @@ func rootHandler() http.HandlerFunc {
 	// Plain-text banner. "tack" rendered in figlet's larry3d font; the
 	// shape mirrors the style the bluesky PDS serves at its own root,
 	// which feels like the right vibe for an atproto-adjacent service.
+	// The two backticks in the larry3d output collide with Go's raw
+	// string delimiter, so we concatenate them in as interpreted
+	// substrings to keep the art byte-identical to figlet's output.
 	const banner = ` __                    __
 /\ \__                /\ \
 \ \ ,_\    __      ___\ \ \/'\
- \ \ \/  /'__'\   /'___\ \ , <
-  \ \ \_/\ \L\.\_/\ \__/\ \ \\'\
+ \ \ \/  /'__` + "`" + `\   /'___\ \ , <
+  \ \ \_/\ \L\.\_/\ \__/\ \ \\` + "`" + `\
    \ \__\ \__/.\_\ \____\\ \_\ \_\
     \/__/\/__/\/_/\/____/ \/_/\/_/
 
 
 This is a tack server: a tangled spindle for other CI services.
+
+Most API routes are under /xrpc/
 
       Code: https://github.com/mitchellh/tack
 `
