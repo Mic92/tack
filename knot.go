@@ -21,8 +21,8 @@ package main
 //
 // The jetstream consumer also gets a back-reference (via the
 // KnotConsumer interface) so it can dynamically subscribe a new knot —
-// or, conceptually, unsubscribe one — the moment a matching
-// sh.tangled.repo record arrives, without waiting for a tack restart.
+// or unsubscribe one — the moment a matching sh.tangled.repo record
+// arrives, without waiting for a tack restart.
 
 import (
 	"context"
@@ -56,11 +56,6 @@ type KnotConsumer interface {
 	// RemoveKnot stops processing events from the given knot. It is the
 	// inverse of AddKnot and must tolerate being called for a knot that
 	// was never added (no-op). An empty knot string is ignored.
-	//
-	// The production implementation is currently a no-op: tangled-core's
-	// eventconsumer does not expose a way to drop an individual source's
-	// websocket. Tracked upstream as
-	// https://tangled.org/did:plc:j5hmlfdrwkvtxm7cjmu7j2is/issues/510
 	RemoveKnot(ctx context.Context, knot string)
 }
 
@@ -212,17 +207,15 @@ func (k *knotConsumer) seedCursorIfMissing(knot string) {
 	)
 }
 
-// RemoveKnot is currently a no-op — see the interface comment for the
-// upstream blocker. We still log at info so operators can see when the
-// reconciliation logic *would* have unsubscribed; once eventconsumer
-// gains a RemoveSource primitive, swap the body for a real call.
+// RemoveKnot unsubscribes from a knot that no longer has any authorized
+// repos pointing at this spindle. Safe to call repeatedly:
+// eventconsumer.Consumer.RemoveSource ignores sources that are not present.
 func (k *knotConsumer) RemoveKnot(_ context.Context, knot string) {
 	if knot == "" {
 		return
 	}
-	k.log.Info("remove knot source requested (no-op until upstream supports it)",
-		"knot", knot,
-	)
+	k.log.Info("removing knot source", "knot", knot)
+	k.c.RemoveSource(eventconsumer.NewKnotSource(knot))
 }
 
 // Stop tears down all knot websocket connections and waits for the

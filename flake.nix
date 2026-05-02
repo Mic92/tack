@@ -29,7 +29,7 @@
           # vendorHash pins the Go module download FOD. Update this whenever
           # go.mod / go.sum changes by replacing it with lib.fakeHash and
           # rebuilding to surface the new hash.
-          vendorHash = "sha256-2G9Bhflpw0BDcytKB4oOGIi3HR2fFd1rwZFcoIC09TQ=";
+          vendorHash = "sha256-BJTnyr5NIw2HZ+7jgnSO1kkEt507BQfLrYht6TKWypg=";
 
           # The repo ships a stale `tack` binary at the root that gets caught
           # by `go test ./...`-style discovery; ignore it during the build.

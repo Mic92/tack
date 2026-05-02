@@ -451,8 +451,7 @@ func TestSpindleMemberGrantSubscribesPendingKnots(t *testing.T) {
 // TestSpindleMemberRevokeUnsubscribesKnot verifies that revoking a
 // previously-granted membership tears down the only-held-by-that-member
 // knot subscription. Without this, an attacker who briefly held
-// membership could leave us dialing their chosen knot until restart,
-// the exact lingering-subscription concern called out in KNOWN_ISSUES.
+// membership could leave us dialing their chosen knot until restart.
 func TestSpindleMemberRevokeUnsubscribesKnot(t *testing.T) {
 	s := newTestStore(t)
 	ctx := context.Background()
