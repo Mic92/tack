@@ -12,8 +12,8 @@
     flake-utils,
     ...
   }:
-    # Per-system outputs (packages, apps, devShells). nixosModules is
-    # system-independent and is merged in below.
+  # Per-system outputs (packages, apps, devShells). nixosModules is
+  # system-independent and is merged in below.
     flake-utils.lib.eachDefaultSystem (
       system: let
         pkgs = nixpkgs.legacyPackages.${system};
@@ -39,6 +39,10 @@
           env.CGO_ENABLED = "1";
         };
       in {
+        # `nix fmt` formats the tree with alejandra. CI pins this same
+        # binary via `nix run nixpkgs#alejandra` for the format check.
+        formatter = pkgs.alejandra;
+
         devShells.default = pkgs.mkShell {
           packages = [
             pkgs.go

@@ -1,4 +1,4 @@
-# NixOS module for the tack spindle. 
+# NixOS module for the tack spindle.
 {
   config,
   lib,
@@ -127,7 +127,7 @@ in
             ]
             ++ optional cfg.dev "TACK_DEV=1"
             ++ optional (cfg.buildkite.org != null)
-              "TACK_BUILDKITE_ORG=${cfg.buildkite.org}";
+            "TACK_BUILDKITE_ORG=${cfg.buildkite.org}";
 
           ExecStart = "${cfg.package}/bin/tack -addr ${cfg.listenAddr}";
           Restart = "always";

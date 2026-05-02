@@ -1,0 +1,12 @@
+when:
+  - event: ["push"]
+    branch: ["main"]
+  - event: ["pull_request"]
+    branch: ["main"]
+
+engine: nixery
+
+tack:
+  buildkite:
+    org: mitchellh
+    pipeline: tack

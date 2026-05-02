@@ -1,0 +1,33 @@
+# In-repo Buildkite pipeline. The Buildkite-side pipeline only needs
+# one step that does `buildkite-agent pipeline upload`; everything
+# real lives here.
+
+steps:
+  - label: ":nix: format check"
+    # `nix fmt` dispatches to the flake's `formatter` output (alejandra).
+    # `--` forwards `--check` to alejandra, which exits non-zero on any
+    # file that would be reformatted so the build fails instead of
+    # silently rewriting files.
+    command: nix fmt -- --check .
+
+  - label: ":go: test"
+    # Run the full Go test suite inside the flake's dev shell so the
+    # toolchain (go, cgo deps for mattn/go-sqlite3) matches what the
+    # package build uses. `nix develop -c` runs the given command in the
+    # default devShell without dropping into an interactive shell.
+    command: nix develop -c go test ./...
+
+  - label: ":nix: package build & smoke"
+    # Build the `tack` flake package and smoke-test the resulting
+    # binary. This catches regressions that `go test` won't, such as a
+    # stale `vendorHash`, broken cgo wiring for mattn/go-sqlite3, or a
+    # linker failure inside the Nix sandbox.
+    #
+    # `tack -h` is the cheapest possible "did the binary load?" check:
+    # `flag.Parse()` runs before any required env-var validation, prints
+    # usage, and exits 0 — proving the binary was produced, links, and
+    # can execute Go init without spinning up the HTTP server, store,
+    # or jetstream consumer.
+    command: |
+      nix build .#tack
+      ./result/bin/tack -h
