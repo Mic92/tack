@@ -255,10 +255,24 @@ func (c *Client) GetJobLog(
 // actually decode. Build events all wrap a "build" object; job
 // events wrap a "job" — keeping both around lets callers add
 // job-level mapping later without changing the decoder.
+//
+// Organization is the top-level organization object Buildkite mirrors
+// onto every webhook. We decode just its slug so the provider can
+// reconstruct (org, pipeline_slug, build_number) from a webhook alone
+// when the local UUID→tuple mapping hasn't been persisted yet (the
+// race between CreateBuild returning and InsertBuildkiteBuild landing).
 type WebhookPayload struct {
-	Event string `json:"event"`
-	Build Build  `json:"build"`
-	Job   Job    `json:"job"`
+	Event        string       `json:"event"`
+	Build        Build        `json:"build"`
+	Job          Job          `json:"job"`
+	Organization Organization `json:"organization"`
+}
+
+// Organization is the small slice of Buildkite's organization object
+// we care about on webhook payloads: just the slug, used as the org
+// component of REST URLs in subsequent calls.
+type Organization struct {
+	Slug string `json:"slug"`
 }
 
 // WebhookMode selects how an inbound webhook request is

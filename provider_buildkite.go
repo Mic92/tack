@@ -544,13 +544,44 @@ func (p *buildkiteProvider) HandleWebhook(
 		return fmt.Errorf("lookup build by uuid: %w", err)
 	}
 	if ref == nil {
-		// Most likely: this build was triggered outside tack and
-		// just happens to share our webhook URL. Nothing to do.
-		p.log.Debug("webhook for unknown build; ignoring",
+		// Cache miss. Two plausible causes:
+		//
+		//   1. Genuinely-foreign build: a Buildkite job triggered
+		//      outside tack that just happens to share this
+		//      webhook URL. Nothing to do.
+		//   2. Race: Spawn's goroutine fired CreateBuild but
+		//      hasn't yet written the UUID→tuple row. A fast
+		//      build.scheduled webhook can land in that window
+		//      and would otherwise be dropped forever.
+		//
+		// We disambiguate using the Buildkite meta_data we set at
+		// CreateBuild time. If the tack:* keys are present the
+		// build is ours; we reconstruct the ref and opportunistically
+		// persist it so subsequent webhooks (and any Logs call)
+		// hit the cache rather than re-doing this work.
+		ref = refFromWebhook(payload)
+		if ref == nil {
+			p.log.Debug("webhook for unknown build; ignoring",
+				"event", payload.Event,
+				"build_uuid", payload.Build.ID,
+			)
+			return nil
+		}
+		// Opportunistic cache fill. Failure here is non-fatal:
+		// Spawn's authoritative insert will land shortly (or has
+		// already, in which case our INSERT … ON CONFLICT just
+		// refreshes the row). We continue with the reconstructed
+		// ref either way so a status publish isn't lost.
+		if err := p.st.InsertBuildkiteBuild(ctx, *ref); err != nil {
+			p.log.Warn("opportunistic persist of buildkite build mapping",
+				"err", err, "build_uuid", ref.BuildUUID,
+			)
+		}
+		p.log.Info("buildkite webhook reconstructed from meta_data",
 			"event", payload.Event,
-			"build_uuid", payload.Build.ID,
+			"build_uuid", ref.BuildUUID,
+			"workflow", ref.Workflow,
 		)
-		return nil
 	}
 
 	status, ok := mapBuildkiteState(payload.Build.State)
@@ -578,6 +609,49 @@ func (p *buildkiteProvider) HandleWebhook(
 		"workflow", ref.Workflow,
 	)
 	return nil
+}
+
+// refFromWebhook reconstructs a BuildkiteBuildRef directly from a
+// webhook payload, using the tack:* meta_data we attach at Spawn
+// time as the source of truth for (knot, pipeline_rkey, workflow).
+// Org and pipeline slug come from the payload's organization and
+// embedded pipeline objects, both of which Buildkite populates on
+// every build.* event.
+//
+// Returns nil when the payload doesn't carry our meta_data: that's
+// the signal the build was triggered outside tack and we should
+// keep ignoring it. A partial set (one or two of the three keys)
+// also returns nil; we don't want to half-reconstruct a row.
+//
+// This exists so HandleWebhook can recover the tuple when the
+// CreateBuild→InsertBuildkiteBuild race drops a webhook on the
+// floor. The caller is expected to opportunistically persist the
+// returned ref so subsequent lookups hit the cache.
+func refFromWebhook(payload buildkite.WebhookPayload) *BuildkiteBuildRef {
+	md := payload.Build.MetaData
+	knot := md[bkMetaKnot]
+	rkey := md[bkMetaPipelineRkey]
+	wf := md[bkMetaWorkflow]
+	if knot == "" || rkey == "" || wf == "" {
+		return nil
+	}
+
+	// Pipeline slug lives on the build's embedded pipeline object.
+	// Decoding it as map[string]interface{} keeps the buildkite
+	// package's Build struct from sprouting fields we only ever
+	// touch on this fallback path.
+	pipelineSlug, _ := payload.Build.Pipeline["slug"].(string)
+
+	return &BuildkiteBuildRef{
+		BuildUUID:    payload.Build.ID,
+		BuildNumber:  payload.Build.Number,
+		PipelineSlug: pipelineSlug,
+		Org:          payload.Organization.Slug,
+		Knot:         knot,
+		PipelineRkey: rkey,
+		Workflow:     wf,
+		PipelineURI:  pipelineATURI(knot, rkey),
+	}
 }
 
 // mapBuildkiteState translates Buildkite's build state strings into

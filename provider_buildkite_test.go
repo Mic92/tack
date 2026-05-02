@@ -463,6 +463,100 @@ func TestBuildkiteHandleWebhookIgnored(t *testing.T) {
 	}
 }
 
+// TestBuildkiteHandleWebhookMetaDataFallback covers the race where
+// a webhook arrives before Spawn has persisted the UUID→tuple row.
+// The handler must reconstruct the ref from the build's tack:*
+// meta_data, publish a status event, and opportunistically persist
+// the row so subsequent lookups hit the cache.
+func TestBuildkiteHandleWebhookMetaDataFallback(t *testing.T) {
+	p, st, _, _ := newBuildkiteTestProvider(t, buildkite.WebhookModeToken, "secret",
+		func(w http.ResponseWriter, r *http.Request) { t.Fatal("buildkite shouldn't be called") })
+
+	// No InsertBuildkiteBuild: simulate the race window where
+	// CreateBuild has returned to Buildkite (so a webhook is in
+	// flight) but the provider hasn't yet written the mapping row.
+	err := p.HandleWebhook(context.Background(), buildkite.WebhookPayload{
+		Event: "build.scheduled",
+		Build: buildkite.Build{
+			ID:     "uuid-race",
+			Number: 42,
+			State:  "scheduled",
+			MetaData: map[string]string{
+				bkMetaKnot:         "knot.example.com",
+				bkMetaPipelineRkey: "rkey-race",
+				bkMetaWorkflow:     "ci.yml",
+			},
+			Pipeline: map[string]any{"slug": "mypipe"},
+		},
+		Organization: buildkite.Organization{Slug: "myorg"},
+	})
+	if err != nil {
+		t.Fatalf("HandleWebhook: %v", err)
+	}
+
+	// Status was published despite the missing cache row.
+	rows, err := st.EventsAfter(context.Background(), 0)
+	if err != nil {
+		t.Fatalf("EventsAfter: %v", err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("got %d events, want 1", len(rows))
+	}
+	var rec tangled.PipelineStatus
+	if err := json.Unmarshal(rows[0].EventJSON, &rec); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if rec.Status != "pending" || rec.Workflow != "ci.yml" {
+		t.Fatalf("bad status: %+v", rec)
+	}
+
+	// Opportunistic insert means the row is now cached for any
+	// subsequent webhook (or Logs call), including the Org and
+	// PipelineSlug we recovered from the payload.
+	ref, err := st.LookupBuildkiteBuildByUUID(context.Background(), "uuid-race")
+	if err != nil {
+		t.Fatalf("lookup: %v", err)
+	}
+	if ref == nil {
+		t.Fatal("expected opportunistic InsertBuildkiteBuild, got nil row")
+	}
+	if ref.Workflow != "ci.yml" || ref.Knot != "knot.example.com" ||
+		ref.PipelineRkey != "rkey-race" || ref.BuildNumber != 42 ||
+		ref.PipelineSlug != "mypipe" || ref.Org != "myorg" {
+		t.Fatalf("ref mismatch: %+v", ref)
+	}
+}
+
+// TestBuildkiteHandleWebhookForeignBuild covers the genuinely-foreign
+// case: a webhook for a build that doesn't carry our tack:* meta_data
+// must remain a silent no-op even though the new fallback path now
+// inspects meta_data.
+func TestBuildkiteHandleWebhookForeignBuild(t *testing.T) {
+	p, st, _, _ := newBuildkiteTestProvider(t, buildkite.WebhookModeToken, "secret",
+		func(w http.ResponseWriter, r *http.Request) {})
+
+	if err := p.HandleWebhook(context.Background(), buildkite.WebhookPayload{
+		Event: "build.finished",
+		Build: buildkite.Build{
+			ID:    "uuid-foreign",
+			State: "passed",
+			// No tack:* keys: build was triggered outside tack.
+			MetaData: map[string]string{"someone-elses-key": "value"},
+		},
+	}); err != nil {
+		t.Fatalf("HandleWebhook: %v", err)
+	}
+
+	rows, _ := st.EventsAfter(context.Background(), 0)
+	if len(rows) != 0 {
+		t.Fatalf("got %d events, want 0", len(rows))
+	}
+	ref, _ := st.LookupBuildkiteBuildByUUID(context.Background(), "uuid-foreign")
+	if ref != nil {
+		t.Fatalf("foreign build was opportunistically persisted: %+v", ref)
+	}
+}
+
 // TestBuildkiteWebhookHandlerHTTP exercises the full HTTP path
 // including auth: a request signed with the wrong secret must be
 // rejected, and a correctly-signed one must reach the provider.
