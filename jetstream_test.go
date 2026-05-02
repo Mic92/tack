@@ -14,6 +14,7 @@ import (
 	"testing"
 
 	jsmodels "github.com/bluesky-social/jetstream/pkg/models"
+	js "go.mitchellh.com/tack/internal/jetstream"
 	"tangled.org/core/api/tangled"
 )
 
@@ -53,6 +54,27 @@ func requireCursor(t *testing.T, s *store, want int64) {
 	if got == nil || *got != want {
 		t.Fatalf("cursor = %v, want %d", got, want)
 	}
+}
+
+// handleJetstreamEvent is the testable per-event entry point. The generic
+// jetstream processor owns cursor advancement; this wrapper only supplies
+// Tack's collection list and commit application callback.
+func handleJetstreamEvent(
+	ctx context.Context,
+	st *store,
+	knots KnotConsumer,
+	hostname, ownerDID string,
+	evt *jsmodels.Event,
+) error {
+	processor := &js.Processor{
+		Collections: jetstreamCollections,
+		CursorStore: st,
+		Handler: js.HandlerFunc(func(ctx context.Context, evt *jsmodels.Event) error {
+			return applyCommit(ctx, st, knots, hostname, ownerDID, evt)
+		}),
+		Logger: loggerFrom(ctx),
+	}
+	return processor.HandleEvent(ctx, evt)
 }
 
 // TestHandleNonCommitEvent confirms account/identity events are ignored
