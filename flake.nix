@@ -29,11 +29,19 @@
           # vendorHash pins the Go module download FOD. Update this whenever
           # go.mod / go.sum changes by replacing it with lib.fakeHash and
           # rebuilding to surface the new hash.
-          vendorHash = "sha256-BJTnyr5NIw2HZ+7jgnSO1kkEt507BQfLrYht6TKWypg=";
+          vendorHash = "sha256-nTnfbKKswY1phPsRCTh/MCe4LdOeQfAJBqwRg3VK64M=";
 
           # The repo ships a stale `tack` binary at the root that gets caught
           # by `go test ./...`-style discovery; ignore it during the build.
           subPackages = ["."];
+
+          # Fetch modules via the Go module proxy instead of synthesizing a
+          # vendor/ directory. We pull in deps (e.g. tangled.org/core ->
+          # go-redis/cache) whose test files require github.com/onsi/gomega;
+          # `go mod vendor` then refuses to build because gomega is in go.mod
+          # but not marked explicit in vendor/modules.txt. Proxy mode sidesteps
+          # the vendor consistency check entirely.
+          proxyVendor = true;
 
           # mattn/go-sqlite3 needs cgo + a C compiler.
           env.CGO_ENABLED = "1";
