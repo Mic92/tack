@@ -1,0 +1,57 @@
+apiVersion: tekton.dev/v1
+kind: Pipeline
+metadata:
+  name: hello-world
+spec:
+  description: Simple Pipeline for validating Tack-created Tekton PipelineRuns.
+  params:
+    - name: message
+      type: string
+      default: Hello from Tack
+    - name: name
+      type: string
+      default: world
+  tasks:
+    - name: say-hello
+      taskRef:
+        name: hello-world
+      params:
+        - name: message
+          value: $(params.message)
+        - name: name
+          value: $(params.name)
+    - name: finish
+      runAfter:
+        - say-hello
+      taskRef:
+        name: hello-world-finish
+      params:
+        - name: name
+          value: $(params.name)
+---
+apiVersion: tekton.dev/v1
+kind: Pipeline
+metadata:
+  name: hello-world-inline
+spec:
+  description: Single inline-task Pipeline for the smallest Tack smoke test.
+  params:
+    - name: message
+      type: string
+      default: Hello from Tack
+  tasks:
+    - name: say-hello
+      taskSpec:
+        params:
+          - name: message
+            type: string
+        steps:
+          - name: hello
+            image: busybox:1.36
+            script: |
+              #!/bin/sh
+              set -eu
+              echo "$(params.message)"
+      params:
+        - name: message
+          value: $(params.message)
