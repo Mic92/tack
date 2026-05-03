@@ -8,31 +8,18 @@ import (
 	"testing"
 	"time"
 
-	corev1 "k8s.io/api/core/v1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
-	"k8s.io/apimachinery/pkg/runtime"
-	runtimeschema "k8s.io/apimachinery/pkg/runtime/schema"
-	dynamicfake "k8s.io/client-go/dynamic/fake"
-	kubefake "k8s.io/client-go/kubernetes/fake"
 	"tangled.org/core/api/tangled"
+
+	"go.mitchellh.com/tack/internal/k8s"
 )
 
-func newTektonTestProvider(t *testing.T, objs ...runtime.Object) (*tektonProvider, *store, *broker) {
+func newTektonTestProvider(t *testing.T) (*tektonProvider, *store, *broker, *k8s.FakeClient) {
 	t.Helper()
 	st := newTestStore(t)
 	br := newBroker(st)
-	dyn := dynamicfake.NewSimpleDynamicClientWithCustomListKinds(
-		runtime.NewScheme(),
-		map[runtimeschema.GroupVersionResource]string{
-			pipelineRunsGVR: "PipelineRunList",
-			taskRunsGVR:     "TaskRunList",
-		},
-		objs...,
-	)
-	kube := kubefake.NewSimpleClientset()
-	p := newTektonProvider(br, st, dyn, kube, "ci", slog.Default())
-	return p, st, br
+	client := k8s.NewFakeClient()
+	p := newTektonProvider(br, st, client, "ci", slog.Default())
+	return p, st, br, client
 }
 
 func TestTektonWorkflowConfig(t *testing.T) {
@@ -73,16 +60,16 @@ func TestTektonBuildPipelineRun(t *testing.T) {
 	if obj.GetAPIVersion() != tektonAPIVersion || obj.GetKind() != tektonRunKind {
 		t.Fatalf("type meta mismatch: %s %s", obj.GetAPIVersion(), obj.GetKind())
 	}
-	pipeline, _, _ := unstructured.NestedString(obj.Object, "spec", "pipelineRef", "name")
-	if pipeline != "repo-ci" {
+	pipeline, ok := obj.NestedString("spec", "pipelineRef", "name")
+	if !ok || pipeline != "repo-ci" {
 		t.Fatalf("pipelineRef.name = %q", pipeline)
 	}
-	sa, _, _ := unstructured.NestedString(obj.Object, "spec", "serviceAccountName")
-	if sa != "runner" {
+	sa, ok := obj.NestedString("spec", "serviceAccountName")
+	if !ok || sa != "runner" {
 		t.Fatalf("serviceAccountName = %q", sa)
 	}
-	params, _, _ := unstructured.NestedSlice(obj.Object, "spec", "params")
-	if len(params) != 1 {
+	params, ok := obj.NestedSlice("spec", "params")
+	if !ok || len(params) != 1 {
 		t.Fatalf("params = %+v", params)
 	}
 	if obj.GetAnnotations()[tektonAnnotationActor] != "did:plc:actor" ||
@@ -119,7 +106,7 @@ func TestTektonStatusMapping(t *testing.T) {
 }
 
 func TestTektonSpawnCreatesPipelineRun(t *testing.T) {
-	p, st, _ := newTektonTestProvider(t)
+	p, st, _, client := newTektonTestProvider(t)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -139,13 +126,12 @@ func TestTektonSpawnCreatesPipelineRun(t *testing.T) {
 		t.Fatalf("ref mismatch: %+v", ref)
 	}
 
-	obj, err := p.dyn.Resource(pipelineRunsGVR).Namespace("ci").
-		Get(context.Background(), ref.PipelineRunName, metav1.GetOptions{})
+	obj, err := client.GetObject(context.Background(), pipelineRunsGVR, "ci", ref.PipelineRunName)
 	if err != nil {
 		t.Fatalf("get PipelineRun: %v", err)
 	}
-	pipeline, _, _ := unstructured.NestedString(obj.Object, "spec", "pipelineRef", "name")
-	if pipeline != "repo-ci" {
+	pipeline, ok := obj.NestedString("spec", "pipelineRef", "name")
+	if !ok || pipeline != "repo-ci" {
 		t.Fatalf("pipelineRef.name = %q", pipeline)
 	}
 
@@ -166,6 +152,7 @@ func TestTektonSpawnCreatesPipelineRun(t *testing.T) {
 }
 
 func TestTektonSpawnAlreadyExists(t *testing.T) {
+	p, st, _, client := newTektonTestProvider(t)
 	name := tektonPipelineRunName("knot.example.com", "rkey-1", "ci.yml", "abcdef0123", "main")
 	existing := buildTektonPipelineRun("ci", name,
 		&tektonWorkflowConfig{Pipeline: "repo-ci"},
@@ -173,10 +160,10 @@ func TestTektonSpawnAlreadyExists(t *testing.T) {
 		&tangled.Pipeline_Workflow{Name: "ci.yml"},
 	)
 	existing.SetUID("uid-1")
-	p, st, _ := newTektonTestProvider(t, existing)
+	client.SeedObject(pipelineRunsGVR, "ci", existing)
+
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-
 	p.Spawn(ctx, "knot.example.com", "rkey-1", "did:plc:actor",
 		&tangled.Pipeline_TriggerMetadata{Push: &tangled.Pipeline_PushTriggerData{
 			NewSha: "abcdef0123",
@@ -193,7 +180,7 @@ func TestTektonSpawnAlreadyExists(t *testing.T) {
 }
 
 func TestTektonLogsLookup(t *testing.T) {
-	p, st, _ := newTektonTestProvider(t)
+	p, st, _, client := newTektonTestProvider(t)
 	ctx := context.Background()
 	if _, err := p.Logs(ctx, "knot.example.com", "rkey-1", "ci.yml"); !errors.Is(err, ErrLogsNotFound) {
 		t.Fatalf("logs before mapping err = %v; want ErrLogsNotFound", err)
@@ -215,37 +202,26 @@ func TestTektonLogsLookup(t *testing.T) {
 		t.Fatalf("logs before TaskRuns err = %v; want ErrLogsNotFound", err)
 	}
 
-	taskRun := &unstructured.Unstructured{Object: map[string]interface{}{
+	client.SeedObject(taskRunsGVR, "ci", k8s.Object{
 		"apiVersion": "tekton.dev/v1",
 		"kind":       "TaskRun",
-		"metadata": map[string]interface{}{
+		"metadata": map[string]any{
 			"name":      "task-1",
 			"namespace": "ci",
-			"labels": map[string]interface{}{
+			"labels": map[string]any{
 				"tekton.dev/pipelineRun": "run-1",
 			},
 		},
-	}}
-	_, err := p.dyn.Resource(taskRunsGVR).Namespace("ci").
-		Create(ctx, taskRun, metav1.CreateOptions{})
-	if err != nil {
-		t.Fatalf("create TaskRun: %v", err)
-	}
-	_, err = p.kube.CoreV1().Pods("ci").Create(ctx, &corev1.Pod{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      "pod-1",
-			Namespace: "ci",
-			Labels: map[string]string{
-				"tekton.dev/taskRun": "task-1",
-			},
+	})
+	client.SeedPod("ci", k8s.Pod{
+		Name:      "pod-1",
+		Namespace: "ci",
+		Labels: map[string]string{
+			"tekton.dev/taskRun": "task-1",
 		},
-		Spec: corev1.PodSpec{
-			Containers: []corev1.Container{{Name: "step-test", Image: "busybox"}},
-		},
-	}, metav1.CreateOptions{})
-	if err != nil {
-		t.Fatalf("create pod: %v", err)
-	}
+		Containers: []k8s.Container{{Name: "step-test"}},
+	})
+	client.SetPodLog("ci", "pod-1", "step-test", "hello\n")
 
 	ch, err := p.Logs(ctx, "knot.example.com", "rkey-1", "ci.yml")
 	if err != nil {
@@ -261,16 +237,16 @@ func TestTektonLogsLookup(t *testing.T) {
 	}
 }
 
-func tektonStatusObject(condStatus, reason string) *unstructured.Unstructured {
-	return &unstructured.Unstructured{Object: map[string]interface{}{
-		"status": map[string]interface{}{
-			"conditions": []interface{}{map[string]interface{}{
+func tektonStatusObject(condStatus, reason string) k8s.Object {
+	return k8s.Object{
+		"status": map[string]any{
+			"conditions": []any{map[string]any{
 				"type":   "Succeeded",
 				"status": condStatus,
 				"reason": reason,
 			}},
 		},
-	}}
+	}
 }
 
 func waitTektonRef(t *testing.T, st *store, knot, rkey, workflow string) *TektonRunRef {

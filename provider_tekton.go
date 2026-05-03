@@ -20,18 +20,9 @@ import (
 	"time"
 	"unicode"
 
-	corev1 "k8s.io/api/core/v1"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
-	"k8s.io/apimachinery/pkg/fields"
-	"k8s.io/apimachinery/pkg/labels"
-	runtimeschema "k8s.io/apimachinery/pkg/runtime/schema"
-	"k8s.io/client-go/dynamic"
-	"k8s.io/client-go/kubernetes"
-	"k8s.io/client-go/rest"
 	"tangled.org/core/api/tangled"
 
+	"go.mitchellh.com/tack/internal/k8s"
 	"go.yaml.in/yaml/v2"
 )
 
@@ -52,10 +43,10 @@ const (
 )
 
 var (
-	pipelineRunsGVR = runtimeschema.GroupVersionResource{
+	pipelineRunsGVR = k8s.GVR{
 		Group: "tekton.dev", Version: "v1", Resource: "pipelineruns",
 	}
-	taskRunsGVR = runtimeschema.GroupVersionResource{
+	taskRunsGVR = k8s.GVR{
 		Group: "tekton.dev", Version: "v1", Resource: "taskruns",
 	}
 )
@@ -97,8 +88,7 @@ type tektonProvider struct {
 	br        *broker
 	st        *store
 	log       *slog.Logger
-	dyn       dynamic.Interface
-	kube      kubernetes.Interface
+	client    k8s.Client
 	namespace string
 }
 
@@ -107,8 +97,7 @@ var _ Provider = (*tektonProvider)(nil)
 func newTektonProvider(
 	br *broker,
 	st *store,
-	dyn dynamic.Interface,
-	kube kubernetes.Interface,
+	client k8s.Client,
 	namespace string,
 	log *slog.Logger,
 ) *tektonProvider {
@@ -116,8 +105,7 @@ func newTektonProvider(
 		br:        br,
 		st:        st,
 		log:       log.With("component", "provider", "kind", "tekton"),
-		dyn:       dyn,
-		kube:      kube,
+		client:    client,
 		namespace: namespace,
 	}
 }
@@ -128,19 +116,11 @@ func newInClusterTektonProvider(
 	namespace string,
 	log *slog.Logger,
 ) (*tektonProvider, error) {
-	cfg, err := rest.InClusterConfig()
+	client, err := k8s.NewInClusterClient()
 	if err != nil {
-		return nil, fmt.Errorf("load in-cluster kubernetes config: %w", err)
+		return nil, fmt.Errorf("configure in-cluster kubernetes client: %w", err)
 	}
-	dyn, err := dynamic.NewForConfig(cfg)
-	if err != nil {
-		return nil, fmt.Errorf("create dynamic kubernetes client: %w", err)
-	}
-	kube, err := kubernetes.NewForConfig(cfg)
-	if err != nil {
-		return nil, fmt.Errorf("create kubernetes client: %w", err)
-	}
-	return newTektonProvider(br, st, dyn, kube, namespace, log), nil
+	return newTektonProvider(br, st, client, namespace, log), nil
 }
 
 func (p *tektonProvider) Spawn(
@@ -192,10 +172,9 @@ func (p *tektonProvider) spawnWorkflow(
 		p.namespace, name, cfg, knot, pipelineRkey, actor, commit, branch, wf,
 	)
 
-	runs := p.dyn.Resource(pipelineRunsGVR).Namespace(p.namespace)
-	created, err := runs.Create(ctx, pr, metav1.CreateOptions{})
-	if apierrors.IsAlreadyExists(err) {
-		created, err = runs.Get(ctx, name, metav1.GetOptions{})
+	created, err := p.client.CreateObject(ctx, pipelineRunsGVR, p.namespace, pr)
+	if errors.Is(err, k8s.ErrAlreadyExists) {
+		created, err = p.client.GetObject(ctx, pipelineRunsGVR, p.namespace, name)
 	}
 	if err != nil {
 		logger.Error("create tekton PipelineRun", "err", err,
@@ -211,7 +190,7 @@ func (p *tektonProvider) spawnWorkflow(
 		Workflow:        wf.Name,
 		Namespace:       p.namespace,
 		PipelineRunName: name,
-		PipelineRunUID:  string(created.GetUID()),
+		PipelineRunUID:  created.GetUID(),
 		PipelineName:    cfg.Pipeline,
 		PipelineURI:     pipelineATURI(knot, pipelineRkey),
 	}
@@ -241,36 +220,34 @@ func buildTektonPipelineRun(
 	cfg *tektonWorkflowConfig,
 	knot, pipelineRkey, actor, commit, branch string,
 	wf *tangled.Pipeline_Workflow,
-) *unstructured.Unstructured {
-	obj := &unstructured.Unstructured{
-		Object: map[string]interface{}{
-			"apiVersion": tektonAPIVersion,
-			"kind":       tektonRunKind,
-			"metadata": map[string]interface{}{
-				"name":      name,
-				"namespace": namespace,
-				"labels": map[string]interface{}{
-					tektonLabelManagedBy:    "tack",
-					tektonLabelPipelineRkey: labelValue(pipelineRkey),
-					tektonLabelWorkflow:     labelValue(wf.Name),
-				},
-				"annotations": map[string]interface{}{
-					tektonAnnotationKnot:         knot,
-					tektonAnnotationPipelineRkey: pipelineRkey,
-					tektonAnnotationWorkflow:     wf.Name,
-					tektonAnnotationActor:        actor,
-					tektonAnnotationCommit:       commit,
-					tektonAnnotationBranch:       branch,
-				},
+) k8s.Object {
+	obj := k8s.Object{
+		"apiVersion": tektonAPIVersion,
+		"kind":       tektonRunKind,
+		"metadata": map[string]any{
+			"name":      name,
+			"namespace": namespace,
+			"labels": map[string]any{
+				tektonLabelManagedBy:    "tack",
+				tektonLabelPipelineRkey: labelValue(pipelineRkey),
+				tektonLabelWorkflow:     labelValue(wf.Name),
 			},
-			"spec": map[string]interface{}{
-				"pipelineRef": map[string]interface{}{
-					"name": cfg.Pipeline,
-				},
+			"annotations": map[string]any{
+				tektonAnnotationKnot:         knot,
+				tektonAnnotationPipelineRkey: pipelineRkey,
+				tektonAnnotationWorkflow:     wf.Name,
+				tektonAnnotationActor:        actor,
+				tektonAnnotationCommit:       commit,
+				tektonAnnotationBranch:       branch,
+			},
+		},
+		"spec": map[string]any{
+			"pipelineRef": map[string]any{
+				"name": cfg.Pipeline,
 			},
 		},
 	}
-	spec := obj.Object["spec"].(map[string]interface{})
+	spec := obj["spec"].(map[string]any)
 	if cfg.ServiceAccount != "" {
 		spec["serviceAccountName"] = cfg.ServiceAccount
 	}
@@ -280,9 +257,9 @@ func buildTektonPipelineRun(
 			keys = append(keys, key)
 		}
 		sort.Strings(keys)
-		params := make([]interface{}, 0, len(keys))
+		params := make([]any, 0, len(keys))
 		for _, key := range keys {
-			params = append(params, map[string]interface{}{
+			params = append(params, map[string]any{
 				"name":  key,
 				"value": cfg.Params[key],
 			})
@@ -304,8 +281,8 @@ func (p *tektonProvider) watchPipelineRun(ctx context.Context, ref TektonRunRef)
 	logger.Debug("watchPipelineRun: starting")
 
 	last := ""
-	if obj, err := p.dyn.Resource(pipelineRunsGVR).Namespace(ref.Namespace).
-		Get(ctx, ref.PipelineRunName, metav1.GetOptions{}); err == nil {
+	if obj, err := p.client.GetObject(ctx, pipelineRunsGVR, ref.Namespace,
+		ref.PipelineRunName); err == nil {
 		status, terminal, ok := mapTektonPipelineRunStatus(obj)
 		logger.Debug("watchPipelineRun: initial status read",
 			"status", status, "terminal", terminal, "ok", ok,
@@ -321,19 +298,16 @@ func (p *tektonProvider) watchPipelineRun(ctx context.Context, ref TektonRunRef)
 				return
 			}
 		}
-	} else if apierrors.IsNotFound(err) {
+	} else if errors.Is(err, k8s.ErrNotFound) {
 		logger.Warn("PipelineRun disappeared while watching")
 		return
 	} else {
 		logger.Debug("initial PipelineRun status read", "err", err)
 	}
 
-	w, err := p.dyn.Resource(pipelineRunsGVR).Namespace(ref.Namespace).
-		Watch(ctx, metav1.ListOptions{
-			FieldSelector: fields.OneTermEqualSelector(
-				"metadata.name", ref.PipelineRunName,
-			).String(),
-		})
+	w, err := p.client.WatchObjects(ctx, pipelineRunsGVR, ref.Namespace,
+		k8s.ListOptions{FieldSelector: "metadata.name=" + ref.PipelineRunName},
+	)
 	if err != nil {
 		logger.Debug("watchPipelineRun: watch failed; falling back to polling", "err", err)
 		p.pollPipelineRun(ctx, ref, logger, last)
@@ -353,12 +327,7 @@ func (p *tektonProvider) watchPipelineRun(ctx context.Context, ref TektonRunRef)
 				p.pollPipelineRun(ctx, ref, logger, last)
 				return
 			}
-			obj, ok := ev.Object.(*unstructured.Unstructured)
-			if !ok {
-				logger.Debug("watchPipelineRun: non-Unstructured event object", "type", fmt.Sprintf("%T", ev.Object))
-				continue
-			}
-			status, terminal, ok := mapTektonPipelineRunStatus(obj)
+			status, terminal, ok := mapTektonPipelineRunStatus(ev.Object)
 			logger.Debug("watchPipelineRun: watch event",
 				"event_type", ev.Type,
 				"status", status, "terminal", terminal, "ok", ok, "last", last,
@@ -400,9 +369,10 @@ func (p *tektonProvider) pollPipelineRun(
 			logger.Debug("pollPipelineRun: context cancelled")
 			return
 		case <-ticker.C:
-			obj, err := p.dyn.Resource(pipelineRunsGVR).Namespace(ref.Namespace).
-				Get(ctx, ref.PipelineRunName, metav1.GetOptions{})
-			if apierrors.IsNotFound(err) {
+			obj, err := p.client.GetObject(ctx, pipelineRunsGVR, ref.Namespace,
+				ref.PipelineRunName,
+			)
+			if errors.Is(err, k8s.ErrNotFound) {
 				logger.Warn("PipelineRun disappeared while watching")
 				return
 			}
@@ -438,8 +408,8 @@ func (p *tektonProvider) pollPipelineRun(
 
 // mapTektonPipelineRunStatus translates Tekton's Succeeded condition
 // into the Tangled status strings consumed by the appview.
-func mapTektonPipelineRunStatus(obj *unstructured.Unstructured) (status string, terminal bool, ok bool) {
-	conditions, ok, _ := unstructured.NestedSlice(obj.Object, "status", "conditions")
+func mapTektonPipelineRunStatus(obj k8s.Object) (status string, terminal bool, ok bool) {
+	conditions, ok := obj.NestedSlice("status", "conditions")
 	if !ok || len(conditions) == 0 {
 		slog.Debug("mapTektonPipelineRunStatus: no conditions found",
 			"pipeline_run", obj.GetName(),
@@ -557,8 +527,9 @@ func (p *tektonProvider) Logs(
 
 // isPipelineRunTerminal returns true if the PipelineRun is in a terminal state right now.
 func (p *tektonProvider) isPipelineRunTerminal(ctx context.Context, ref TektonRunRef) bool {
-	obj, err := p.dyn.Resource(pipelineRunsGVR).Namespace(ref.Namespace).
-		Get(ctx, ref.PipelineRunName, metav1.GetOptions{})
+	obj, err := p.client.GetObject(ctx, pipelineRunsGVR, ref.Namespace,
+		ref.PipelineRunName,
+	)
 	if err != nil {
 		p.log.Debug("isPipelineRunTerminal: failed to get PipelineRun", "err", err, "pipeline_run", ref.PipelineRunName)
 		return false
@@ -576,7 +547,7 @@ func (p *tektonProvider) fetchCompletedTaskRunLogs(
 	ctx context.Context,
 	out chan<- LogLine,
 	ref TektonRunRef,
-	tr unstructured.Unstructured,
+	tr k8s.Object,
 	stepID int,
 ) {
 	trName := tr.GetName()
@@ -593,15 +564,15 @@ func (p *tektonProvider) fetchCompletedTaskRunLogs(
 
 	// Emit a summary line from the TaskRun status (steps[*].terminated) so we
 	// get exit codes and reasons even if the pod logs are sparse.
-	steps, _, _ := unstructured.NestedSlice(tr.Object, "status", "steps")
+	steps, _ := tr.NestedSlice("status", "steps")
 	for _, rawStep := range steps {
-		step, _ := rawStep.(map[string]interface{})
+		step, _ := rawStep.(map[string]any)
 		stepName, _ := step["name"].(string)
-		term, _ := step["terminated"].(map[string]interface{})
+		term, _ := step["terminated"].(map[string]any)
 		if term == nil {
 			continue
 		}
-		exitCode, _ := term["exitCode"].(int64)
+		exitCode := numberToInt64(term["exitCode"])
 		reason, _ := term["reason"].(string)
 		msg, _ := term["message"].(string)
 		line := fmt.Sprintf("[step %s] exit=%d reason=%s", stepName, exitCode, reason)
@@ -624,7 +595,8 @@ func (p *tektonProvider) fetchCompletedTaskRunLogs(
 	}
 
 	for _, pod := range pods {
-		containers := append(pod.Spec.InitContainers, pod.Spec.Containers...)
+		containers := append([]k8s.Container(nil), pod.InitContainers...)
+		containers = append(containers, pod.Containers...)
 		p.log.Debug("fetchCompletedTaskRunLogs: reading pod containers",
 			"pod", pod.Name, "container_count", len(containers),
 		)
@@ -632,10 +604,7 @@ func (p *tektonProvider) fetchCompletedTaskRunLogs(
 			p.log.Debug("fetchCompletedTaskRunLogs: reading container logs",
 				"pod", pod.Name, "container", c.Name,
 			)
-			req := p.kube.CoreV1().Pods(ref.Namespace).GetLogs(pod.Name, &corev1.PodLogOptions{
-				Container: c.Name,
-			})
-			rc, err := req.Stream(ctx)
+			rc, err := p.client.StreamPodLogs(ctx, ref.Namespace, pod.Name, c.Name)
 			if err != nil {
 				p.log.Debug("fetchCompletedTaskRunLogs: stream failed", "err", err,
 					"pod", pod.Name, "container", c.Name,
@@ -651,18 +620,18 @@ func (p *tektonProvider) fetchCompletedTaskRunLogs(
 	}
 }
 
-func (p *tektonProvider) taskRunsForPipelineRun(ctx context.Context, ref TektonRunRef) ([]unstructured.Unstructured, error) {
-	sel := labels.Set{"tekton.dev/pipelineRun": ref.PipelineRunName}.String()
-	list, err := p.dyn.Resource(taskRunsGVR).Namespace(ref.Namespace).
-		List(ctx, metav1.ListOptions{LabelSelector: sel})
+func (p *tektonProvider) taskRunsForPipelineRun(ctx context.Context, ref TektonRunRef) ([]k8s.Object, error) {
+	list, err := p.client.ListObjects(ctx, taskRunsGVR, ref.Namespace, k8s.ListOptions{
+		LabelSelector: "tekton.dev/pipelineRun=" + ref.PipelineRunName,
+	})
 	if err != nil {
 		return nil, fmt.Errorf("list Tekton TaskRuns: %w", err)
 	}
-	items := append([]unstructured.Unstructured(nil), list.Items...)
+	items := append([]k8s.Object(nil), list...)
 	sort.Slice(items, func(i, j int) bool {
 		ti := items[i].GetCreationTimestamp()
 		tj := items[j].GetCreationTimestamp()
-		return ti.Before(&tj)
+		return ti.Before(tj)
 	})
 	return items, nil
 }
@@ -671,7 +640,7 @@ func (p *tektonProvider) streamTaskRunLogs(
 	ctx context.Context,
 	out chan<- LogLine,
 	ref TektonRunRef,
-	tr unstructured.Unstructured,
+	tr k8s.Object,
 	stepID int,
 ) {
 	pods, err := p.podsForTaskRun(ctx, ref.Namespace, tr.GetName())
@@ -685,7 +654,8 @@ func (p *tektonProvider) streamTaskRunLogs(
 		"task_run", tr.GetName(), "pod_count", len(pods),
 	)
 	for _, pod := range pods {
-		containers := append(pod.Spec.InitContainers, pod.Spec.Containers...)
+		containers := append([]k8s.Container(nil), pod.InitContainers...)
+		containers = append(containers, pod.Containers...)
 		p.log.Debug("streamTaskRunLogs: streaming pod containers",
 			"pod", pod.Name, "container_count", len(containers),
 		)
@@ -693,10 +663,7 @@ func (p *tektonProvider) streamTaskRunLogs(
 			p.log.Debug("streamTaskRunLogs: streaming container",
 				"pod", pod.Name, "container", c.Name, "step_id", stepID,
 			)
-			req := p.kube.CoreV1().Pods(ref.Namespace).GetLogs(pod.Name, &corev1.PodLogOptions{
-				Container: c.Name,
-			})
-			rc, err := req.Stream(ctx)
+			rc, err := p.client.StreamPodLogs(ctx, ref.Namespace, pod.Name, c.Name)
 			if err != nil {
 				p.log.Debug("streamTaskRunLogs: stream pod logs failed", "err", err,
 					"pod", pod.Name, "container", c.Name,
@@ -712,17 +679,16 @@ func (p *tektonProvider) streamTaskRunLogs(
 	}
 }
 
-func (p *tektonProvider) podsForTaskRun(ctx context.Context, namespace, taskRun string) ([]corev1.Pod, error) {
-	sel := labels.Set{"tekton.dev/taskRun": taskRun}.String()
-	list, err := p.kube.CoreV1().Pods(namespace).List(ctx, metav1.ListOptions{
-		LabelSelector: sel,
-	})
+func (p *tektonProvider) podsForTaskRun(ctx context.Context, namespace, taskRun string) ([]k8s.Pod, error) {
+	list, err := p.client.ListPods(ctx, namespace,
+		"tekton.dev/taskRun="+taskRun,
+	)
 	if err != nil {
 		return nil, fmt.Errorf("list pods: %w", err)
 	}
-	pods := append([]corev1.Pod(nil), list.Items...)
+	pods := append([]k8s.Pod(nil), list...)
 	sort.Slice(pods, func(i, j int) bool {
-		return pods[i].CreationTimestamp.Before(&pods[j].CreationTimestamp)
+		return pods[i].CreationTimestamp.Before(pods[j].CreationTimestamp)
 	})
 	return pods, nil
 }
@@ -747,6 +713,22 @@ func (p *tektonProvider) sendReaderLines(
 	}
 	if err := scanner.Err(); err != nil {
 		p.log.Debug("scan pod log", "err", err)
+	}
+}
+
+func numberToInt64(value any) int64 {
+	switch v := value.(type) {
+	case int64:
+		return v
+	case int:
+		return int64(v)
+	case float64:
+		return int64(v)
+	case json.Number:
+		i, _ := v.Int64()
+		return i
+	default:
+		return 0
 	}
 }
 
