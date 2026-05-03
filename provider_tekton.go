@@ -301,13 +301,13 @@ func (p *tektonProvider) watchPipelineRun(ctx context.Context, ref TektonRunRef)
 		"pipeline_run", ref.PipelineRunName,
 	)
 
-	logger.Info("watchPipelineRun: starting")
+	logger.Debug("watchPipelineRun: starting")
 
 	last := ""
 	if obj, err := p.dyn.Resource(pipelineRunsGVR).Namespace(ref.Namespace).
 		Get(ctx, ref.PipelineRunName, metav1.GetOptions{}); err == nil {
 		status, terminal, ok := mapTektonPipelineRunStatus(obj)
-		logger.Info("watchPipelineRun: initial status read",
+		logger.Debug("watchPipelineRun: initial status read",
 			"status", status, "terminal", terminal, "ok", ok,
 		)
 		if ok {
@@ -317,7 +317,7 @@ func (p *tektonProvider) watchPipelineRun(ctx context.Context, ref TektonRunRef)
 				logger.Error("publish tekton status", "err", err, "status", status)
 			}
 			if terminal {
-				logger.Info("watchPipelineRun: already terminal on initial read; exiting", "status", status)
+				logger.Debug("watchPipelineRun: already terminal on initial read; exiting", "status", status)
 				return
 			}
 		}
@@ -335,21 +335,21 @@ func (p *tektonProvider) watchPipelineRun(ctx context.Context, ref TektonRunRef)
 			).String(),
 		})
 	if err != nil {
-		logger.Info("watchPipelineRun: watch failed; falling back to polling", "err", err)
+		logger.Debug("watchPipelineRun: watch failed; falling back to polling", "err", err)
 		p.pollPipelineRun(ctx, ref, logger, last)
 		return
 	}
 	defer w.Stop()
 
-	logger.Info("watchPipelineRun: watch established; entering event loop")
+	logger.Debug("watchPipelineRun: watch established; entering event loop")
 	for {
 		select {
 		case <-ctx.Done():
-			logger.Info("watchPipelineRun: context cancelled")
+			logger.Debug("watchPipelineRun: context cancelled")
 			return
 		case ev, ok := <-w.ResultChan():
 			if !ok {
-				logger.Info("watchPipelineRun: watch channel closed; falling back to polling")
+				logger.Debug("watchPipelineRun: watch channel closed; falling back to polling")
 				p.pollPipelineRun(ctx, ref, logger, last)
 				return
 			}
@@ -359,13 +359,13 @@ func (p *tektonProvider) watchPipelineRun(ctx context.Context, ref TektonRunRef)
 				continue
 			}
 			status, terminal, ok := mapTektonPipelineRunStatus(obj)
-			logger.Info("watchPipelineRun: watch event",
+			logger.Debug("watchPipelineRun: watch event",
 				"event_type", ev.Type,
 				"status", status, "terminal", terminal, "ok", ok, "last", last,
 			)
 			if !ok || status == last {
 				if terminal {
-					logger.Info("watchPipelineRun: terminal status unchanged; exiting", "status", status)
+					logger.Debug("watchPipelineRun: terminal status unchanged; exiting", "status", status)
 					return
 				}
 				continue
@@ -376,9 +376,9 @@ func (p *tektonProvider) watchPipelineRun(ctx context.Context, ref TektonRunRef)
 				logger.Error("publish tekton status", "err", err, "status", status)
 				continue
 			}
-			logger.Info("watchPipelineRun: published status", "status", status, "terminal", terminal)
+			logger.Debug("watchPipelineRun: published status", "status", status, "terminal", terminal)
 			if terminal {
-				logger.Info("watchPipelineRun: terminal status reached; exiting", "status", status)
+				logger.Debug("watchPipelineRun: terminal status reached; exiting", "status", status)
 				return
 			}
 		}
@@ -391,13 +391,13 @@ func (p *tektonProvider) pollPipelineRun(
 	logger *slog.Logger,
 	last string,
 ) {
-	logger.Info("pollPipelineRun: starting poll loop", "interval", "5s")
+	logger.Debug("pollPipelineRun: starting poll loop", "interval", "5s")
 	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
 	for {
 		select {
 		case <-ctx.Done():
-			logger.Info("pollPipelineRun: context cancelled")
+			logger.Debug("pollPipelineRun: context cancelled")
 			return
 		case <-ticker.C:
 			obj, err := p.dyn.Resource(pipelineRunsGVR).Namespace(ref.Namespace).
@@ -411,12 +411,12 @@ func (p *tektonProvider) pollPipelineRun(
 				continue
 			}
 			status, terminal, ok := mapTektonPipelineRunStatus(obj)
-			logger.Info("pollPipelineRun: poll tick",
+			logger.Debug("pollPipelineRun: poll tick",
 				"status", status, "terminal", terminal, "ok", ok, "last", last,
 			)
 			if !ok || status == last {
 				if terminal {
-					logger.Info("pollPipelineRun: terminal status unchanged; exiting", "status", status)
+					logger.Debug("pollPipelineRun: terminal status unchanged; exiting", "status", status)
 					return
 				}
 				continue
@@ -427,9 +427,9 @@ func (p *tektonProvider) pollPipelineRun(
 				logger.Error("publish tekton status", "err", err, "status", status)
 				continue
 			}
-			logger.Info("pollPipelineRun: published status", "status", status, "terminal", terminal)
+			logger.Debug("pollPipelineRun: published status", "status", status, "terminal", terminal)
 			if terminal {
-				logger.Info("pollPipelineRun: terminal status reached; exiting", "status", status)
+				logger.Debug("pollPipelineRun: terminal status reached; exiting", "status", status)
 				return
 			}
 		}
@@ -452,7 +452,7 @@ func mapTektonPipelineRunStatus(obj *unstructured.Unstructured) (status string, 
 		condStatus, _ := cond["status"].(string)
 		reason, _ := cond["reason"].(string)
 		message, _ := cond["message"].(string)
-		slog.Info("mapTektonPipelineRunStatus: condition",
+		slog.Debug("mapTektonPipelineRunStatus: condition",
 			"pipeline_run", obj.GetName(),
 			"type", condType,
 			"status", condStatus,
@@ -502,7 +502,7 @@ func (p *tektonProvider) Logs(
 	if err != nil {
 		return nil, err
 	}
-	p.log.Info("Logs: found TaskRuns for PipelineRun",
+	p.log.Debug("Logs: found TaskRuns for PipelineRun",
 		"pipeline_run", ref.PipelineRunName, "count", len(taskRuns),
 	)
 	if len(taskRuns) == 0 {
@@ -510,7 +510,7 @@ func (p *tektonProvider) Logs(
 	}
 
 	terminal := p.isPipelineRunTerminal(ctx, *ref)
-	p.log.Info("Logs: pipeline run terminal state", "pipeline_run", ref.PipelineRunName, "terminal", terminal)
+	p.log.Debug("Logs: pipeline run terminal state", "pipeline_run", ref.PipelineRunName, "terminal", terminal)
 
 	out := make(chan LogLine, 32)
 	go func() {
@@ -521,7 +521,7 @@ func (p *tektonProvider) Logs(
 			if taskName == "" {
 				taskName = fmt.Sprintf("task %d", stepID)
 			}
-			p.log.Info("Logs: streaming TaskRun", "task_run", taskName, "step_id", stepID, "terminal", terminal)
+			p.log.Debug("Logs: streaming TaskRun", "task_run", taskName, "step_id", stepID, "terminal", terminal)
 			if !sendLine(ctx, out, LogLine{
 				Kind:       LogKindControl,
 				Time:       time.Now(),
@@ -547,10 +547,10 @@ func (p *tektonProvider) Logs(
 			}) {
 				return
 			}
-			p.log.Info("Logs: finished TaskRun", "task_run", taskName, "step_id", stepID)
+			p.log.Debug("Logs: finished TaskRun", "task_run", taskName, "step_id", stepID)
 			stepID++
 		}
-		p.log.Info("Logs: all TaskRuns streamed", "pipeline_run", ref.PipelineRunName)
+		p.log.Debug("Logs: all TaskRuns streamed", "pipeline_run", ref.PipelineRunName)
 	}()
 	return out, nil
 }
@@ -560,11 +560,11 @@ func (p *tektonProvider) isPipelineRunTerminal(ctx context.Context, ref TektonRu
 	obj, err := p.dyn.Resource(pipelineRunsGVR).Namespace(ref.Namespace).
 		Get(ctx, ref.PipelineRunName, metav1.GetOptions{})
 	if err != nil {
-		p.log.Info("isPipelineRunTerminal: failed to get PipelineRun", "err", err, "pipeline_run", ref.PipelineRunName)
+		p.log.Debug("isPipelineRunTerminal: failed to get PipelineRun", "err", err, "pipeline_run", ref.PipelineRunName)
 		return false
 	}
 	_, terminal, ok := mapTektonPipelineRunStatus(obj)
-	p.log.Info("isPipelineRunTerminal: status check", "pipeline_run", ref.PipelineRunName, "terminal", terminal, "ok", ok)
+	p.log.Debug("isPipelineRunTerminal: status check", "pipeline_run", ref.PipelineRunName, "terminal", terminal, "ok", ok)
 	return ok && terminal
 }
 
@@ -582,12 +582,12 @@ func (p *tektonProvider) fetchCompletedTaskRunLogs(
 	trName := tr.GetName()
 	pods, err := p.podsForTaskRun(ctx, ref.Namespace, trName)
 	if err != nil {
-		p.log.Info("fetchCompletedTaskRunLogs: list pods failed", "err", err,
+		p.log.Debug("fetchCompletedTaskRunLogs: list pods failed", "err", err,
 			"task_run", trName, "pipeline_run", ref.PipelineRunName,
 		)
 		return
 	}
-	p.log.Info("fetchCompletedTaskRunLogs: found pods",
+	p.log.Debug("fetchCompletedTaskRunLogs: found pods",
 		"task_run", trName, "pod_count", len(pods),
 	)
 
@@ -608,7 +608,7 @@ func (p *tektonProvider) fetchCompletedTaskRunLogs(
 		if msg != "" {
 			line += " " + msg
 		}
-		p.log.Info("fetchCompletedTaskRunLogs: step terminated",
+		p.log.Debug("fetchCompletedTaskRunLogs: step terminated",
 			"task_run", trName, "step", stepName,
 			"exit_code", exitCode, "reason", reason,
 		)
@@ -625,11 +625,11 @@ func (p *tektonProvider) fetchCompletedTaskRunLogs(
 
 	for _, pod := range pods {
 		containers := append(pod.Spec.InitContainers, pod.Spec.Containers...)
-		p.log.Info("fetchCompletedTaskRunLogs: reading pod containers",
+		p.log.Debug("fetchCompletedTaskRunLogs: reading pod containers",
 			"pod", pod.Name, "container_count", len(containers),
 		)
 		for _, c := range containers {
-			p.log.Info("fetchCompletedTaskRunLogs: reading container logs",
+			p.log.Debug("fetchCompletedTaskRunLogs: reading container logs",
 				"pod", pod.Name, "container", c.Name,
 			)
 			req := p.kube.CoreV1().Pods(ref.Namespace).GetLogs(pod.Name, &corev1.PodLogOptions{
@@ -637,14 +637,14 @@ func (p *tektonProvider) fetchCompletedTaskRunLogs(
 			})
 			rc, err := req.Stream(ctx)
 			if err != nil {
-				p.log.Info("fetchCompletedTaskRunLogs: stream failed", "err", err,
+				p.log.Debug("fetchCompletedTaskRunLogs: stream failed", "err", err,
 					"pod", pod.Name, "container", c.Name,
 				)
 				continue
 			}
 			p.sendReaderLines(ctx, out, rc, stepID)
 			_ = rc.Close()
-			p.log.Info("fetchCompletedTaskRunLogs: done reading container",
+			p.log.Debug("fetchCompletedTaskRunLogs: done reading container",
 				"pod", pod.Name, "container", c.Name,
 			)
 		}
@@ -676,21 +676,21 @@ func (p *tektonProvider) streamTaskRunLogs(
 ) {
 	pods, err := p.podsForTaskRun(ctx, ref.Namespace, tr.GetName())
 	if err != nil {
-		p.log.Info("streamTaskRunLogs: list pods for TaskRun failed", "err", err,
+		p.log.Debug("streamTaskRunLogs: list pods for TaskRun failed", "err", err,
 			"task_run", tr.GetName(), "pipeline_run", ref.PipelineRunName,
 		)
 		return
 	}
-	p.log.Info("streamTaskRunLogs: found pods",
+	p.log.Debug("streamTaskRunLogs: found pods",
 		"task_run", tr.GetName(), "pod_count", len(pods),
 	)
 	for _, pod := range pods {
 		containers := append(pod.Spec.InitContainers, pod.Spec.Containers...)
-		p.log.Info("streamTaskRunLogs: streaming pod containers",
+		p.log.Debug("streamTaskRunLogs: streaming pod containers",
 			"pod", pod.Name, "container_count", len(containers),
 		)
 		for _, c := range containers {
-			p.log.Info("streamTaskRunLogs: streaming container",
+			p.log.Debug("streamTaskRunLogs: streaming container",
 				"pod", pod.Name, "container", c.Name, "step_id", stepID,
 			)
 			req := p.kube.CoreV1().Pods(ref.Namespace).GetLogs(pod.Name, &corev1.PodLogOptions{
@@ -698,14 +698,14 @@ func (p *tektonProvider) streamTaskRunLogs(
 			})
 			rc, err := req.Stream(ctx)
 			if err != nil {
-				p.log.Info("streamTaskRunLogs: stream pod logs failed", "err", err,
+				p.log.Debug("streamTaskRunLogs: stream pod logs failed", "err", err,
 					"pod", pod.Name, "container", c.Name,
 				)
 				continue
 			}
 			p.sendReaderLines(ctx, out, rc, stepID)
 			_ = rc.Close()
-			p.log.Info("streamTaskRunLogs: finished container",
+			p.log.Debug("streamTaskRunLogs: finished container",
 				"pod", pod.Name, "container", c.Name,
 			)
 		}
