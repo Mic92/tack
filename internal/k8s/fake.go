@@ -228,6 +228,7 @@ func (c *FakeClient) StreamPodLogs(
 	namespace string,
 	podName string,
 	container string,
+	opts LogOptions,
 ) (io.ReadCloser, error) {
 	select {
 	case <-ctx.Done():
@@ -236,20 +237,56 @@ func (c *FakeClient) StreamPodLogs(
 	}
 
 	c.mu.Lock()
-	defer c.mu.Unlock()
 	raw, ok := c.podLogs[podLogKey{
 		namespace: namespace,
 		podName:   podName,
 		container: container,
 	}]
+	c.mu.Unlock()
 	if !ok {
 		return nil, fmt.Errorf(
 			"%w: pod log %s/%s[%s]",
 			ErrNotFound, namespace, podName, container,
 		)
 	}
-	return io.NopCloser(strings.NewReader(raw)), nil
+	if !opts.Follow {
+		return io.NopCloser(strings.NewReader(raw)), nil
+	}
+	// In Follow mode, mirror the kube apiserver: yield the seeded bytes,
+	// then keep the stream open until ctx is cancelled. Tests that exercise
+	// the live-streaming path drive termination by cancelling the context;
+	// tests that want a one-shot snapshot should leave Follow=false.
+	return &fakeFollowReader{rest: raw, ctx: ctx}, nil
 }
+
+// fakeFollowReader returns the seeded log bytes, then blocks on ctx.Done()
+// before EOFing. This matches the apiserver behaviour for follow=true:
+// the connection only closes once the container terminates (or the caller
+// hangs up), so callers using bufio.Scanner do not see a premature EOF and
+// treat a still-running container as completed.
+type fakeFollowReader struct {
+	rest string
+	ctx  context.Context
+	done bool
+}
+
+var _ io.ReadCloser = (*fakeFollowReader)(nil)
+
+func (r *fakeFollowReader) Read(p []byte) (int, error) {
+	if len(r.rest) > 0 {
+		n := copy(p, r.rest)
+		r.rest = r.rest[n:]
+		return n, nil
+	}
+	if r.done {
+		return 0, io.EOF
+	}
+	r.done = true
+	<-r.ctx.Done()
+	return 0, io.EOF
+}
+
+func (r *fakeFollowReader) Close() error { return nil }
 
 func (c *FakeClient) createObject(
 	gvr GVR,

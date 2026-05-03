@@ -242,10 +242,19 @@ func (c *InClusterClient) StreamPodLogs(
 	namespace string,
 	podName string,
 	container string,
+	opts LogOptions,
 ) (io.ReadCloser, error) {
 	query := url.Values{}
 	if container != "" {
 		query.Set("container", container)
+	}
+	// follow=true makes the API server hold the connection open and push
+	// new log bytes as the container writes them, only closing when the
+	// container terminates. Without it, the response is a snapshot of
+	// whatever has been written so far, which silently truncates live
+	// runs.
+	if opts.Follow {
+		query.Set("follow", "true")
 	}
 	resp, err := c.do(ctx, http.MethodGet,
 		coreResourcePath(namespace, podsResource, podName, podLogsSubresource),

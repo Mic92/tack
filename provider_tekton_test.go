@@ -236,6 +236,25 @@ func TestTektonLogsLookup(t *testing.T) {
 		}
 	}
 
+	// Seed a terminal PipelineRun so Logs takes the snapshot path
+	// (fetchCompletedTaskRunLogs, Follow=false) and closes the
+	// channel after draining the seeded TaskRun. The non-terminal
+	// path follows pod logs live and would only EOF on ctx cancel,
+	// which is not what this assertion is exercising.
+	client.SeedObject(pipelineRunsGVR, "ci", k8s.Object{
+		"apiVersion": "tekton.dev/v1",
+		"kind":       "PipelineRun",
+		"metadata": map[string]any{
+			"name":      "run-1",
+			"namespace": "ci",
+		},
+		"status": map[string]any{
+			"conditions": []any{map[string]any{
+				"type":   "Succeeded",
+				"status": "True",
+			}},
+		},
+	})
 	client.SeedObject(taskRunsGVR, "ci", k8s.Object{
 		"apiVersion": "tekton.dev/v1",
 		"kind":       "TaskRun",

@@ -61,7 +61,21 @@ type Client interface {
 		namespace string,
 		podName string,
 		container string,
+		opts LogOptions,
 	) (io.ReadCloser, error)
+}
+
+// LogOptions controls how StreamPodLogs reads container logs.
+type LogOptions struct {
+	// Follow tells the API server to keep the connection open and stream
+	// new log bytes as the container writes them, only EOFing when the
+	// container terminates (or ctx is cancelled). Without Follow, the
+	// returned reader is a snapshot: it yields the bytes that exist at
+	// request time and then EOFs immediately, even if the container is
+	// still running. Live-streaming callers MUST set Follow=true; using
+	// the snapshot mode for a still-running container makes the caller
+	// look at a frozen view and treat the container as if it had finished.
+	Follow bool
 }
 
 // GVR identifies a Kubernetes resource by the path segments the API server

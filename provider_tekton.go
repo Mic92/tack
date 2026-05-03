@@ -486,31 +486,83 @@ func (p *tektonProvider) Logs(
 	out := make(chan LogLine, 32)
 	go func() {
 		defer close(out)
+		p.streamPipelineRunLogs(ctx, out, *ref)
+	}()
+	return out, nil
+}
 
-		taskRuns := p.waitForTaskRuns(ctx, *ref)
-		if len(taskRuns) == 0 {
-			// Either ctx was cancelled, or the PipelineRun
-			// reached a terminal state without ever scheduling
-			// any TaskRuns. Both cases close an empty stream;
-			// there's nothing to send.
+// streamPipelineRunLogs drives the Logs channel for a single PipelineRun.
+// It polls for TaskRuns until the PipelineRun is terminal (or ctx is
+// cancelled), streaming each TaskRun's logs exactly once.
+//
+// The loop is deliberately a poll rather than a one-shot pass for two
+// reasons:
+//
+//  1. Live runs need follow semantics. Streaming a still-running TaskRun
+//     uses Follow=true on the pod log stream, so streamTaskRunLogs only
+//     returns once the container actually terminates. The outer loop
+//     then re-checks for new TaskRuns and the PipelineRun's terminal
+//     state, instead of closing the channel mid-run.
+//
+//  2. PipelineRuns can spawn additional TaskRuns over time (sequential
+//     `runAfter` tasks, finally blocks, retries). A single snapshot
+//     would silently drop any TaskRun that appears after the snapshot,
+//     even though the workflow is still running.
+//
+// The loop terminates only when the PipelineRun is terminal AND the
+// most recent listing produced no new TaskRuns, which together mean no
+// further TaskRuns will ever appear.
+func (p *tektonProvider) streamPipelineRunLogs(
+	ctx context.Context,
+	out chan<- LogLine,
+	ref TektonRunRef,
+) {
+	const pollInterval = 1 * time.Second
+	seen := map[string]bool{}
+	stepID := 0
+	for {
+		if err := ctx.Err(); err != nil {
 			return
 		}
-		p.log.Debug("Logs: found TaskRuns for PipelineRun",
-			"pipeline_run", ref.PipelineRunName, "count", len(taskRuns),
-		)
 
-		terminal := p.isPipelineRunTerminal(ctx, *ref)
-		p.log.Debug("Logs: pipeline run terminal state",
-			"pipeline_run", ref.PipelineRunName, "terminal", terminal,
-		)
+		taskRuns, err := p.taskRunsForPipelineRun(ctx, ref)
+		if err != nil {
+			p.log.Debug("Logs: list TaskRuns failed",
+				"err", err, "pipeline_run", ref.PipelineRunName,
+			)
+		}
+		// Snapshot the terminal state *after* the listing so we never
+		// observe terminal=true while still missing a TaskRun that
+		// existed at list time. The reverse race (terminal observed
+		// before a TaskRun spawn) is handled by the next iteration: we
+		// only exit when terminal is true AND no new TaskRuns showed up
+		// in this pass.
+		terminal := p.isPipelineRunTerminal(ctx, ref)
 
-		stepID := 0
+		var fresh []k8s.Object
 		for _, tr := range taskRuns {
+			name := tr.GetName()
+			if name == "" || seen[name] {
+				continue
+			}
+			seen[name] = true
+			fresh = append(fresh, tr)
+		}
+		p.log.Debug("Logs: poll iteration",
+			"pipeline_run", ref.PipelineRunName,
+			"task_runs_total", len(taskRuns),
+			"task_runs_new", len(fresh),
+			"terminal", terminal,
+		)
+
+		for _, tr := range fresh {
 			taskName := tr.GetName()
 			if taskName == "" {
 				taskName = fmt.Sprintf("task %d", stepID)
 			}
-			p.log.Debug("Logs: streaming TaskRun", "task_run", taskName, "step_id", stepID, "terminal", terminal)
+			p.log.Debug("Logs: streaming TaskRun",
+				"task_run", taskName, "step_id", stepID, "terminal", terminal,
+			)
 			if !sendLine(ctx, out, LogLine{
 				Kind:       LogKindControl,
 				Time:       time.Now(),
@@ -521,10 +573,16 @@ func (p *tektonProvider) Logs(
 				return
 			}
 
+			// terminal is the snapshot taken at the top of this
+			// iteration. If the pipeline was terminal then, all
+			// TaskRuns we see are guaranteed complete and we can
+			// take the snapshot fast-path; otherwise we follow the
+			// pod logs live so StepStatusEnd is only emitted once
+			// the container actually exits.
 			if terminal {
-				p.fetchCompletedTaskRunLogs(ctx, out, *ref, tr, stepID)
+				p.fetchCompletedTaskRunLogs(ctx, out, ref, tr, stepID)
 			} else {
-				p.streamTaskRunLogs(ctx, out, *ref, tr, stepID)
+				p.streamTaskRunLogs(ctx, out, ref, tr, stepID)
 			}
 
 			if !sendLine(ctx, out, LogLine{
@@ -536,48 +594,35 @@ func (p *tektonProvider) Logs(
 			}) {
 				return
 			}
-			p.log.Debug("Logs: finished TaskRun", "task_run", taskName, "step_id", stepID)
+			p.log.Debug("Logs: finished TaskRun",
+				"task_run", taskName, "step_id", stepID,
+			)
 			stepID++
 		}
-		p.log.Debug("Logs: all TaskRuns streamed", "pipeline_run", ref.PipelineRunName)
-	}()
-	return out, nil
-}
 
-// waitForTaskRuns blocks until at least one TaskRun belonging to the
-// PipelineRun in ref is observable, the PipelineRun reaches a terminal
-// state with no TaskRuns, or ctx is cancelled. It exists so Logs can
-// keep the channel open across the gap between PipelineRun creation
-// and Tekton scheduling its TaskRuns, instead of mistranslating that
-// gap into a 404. The first iteration always probes immediately so a
-// PipelineRun that already has TaskRuns is returned without waiting.
-func (p *tektonProvider) waitForTaskRuns(
-	ctx context.Context,
-	ref TektonRunRef,
-) []k8s.Object {
-	const interval = 1 * time.Second
-	for {
-		taskRuns, err := p.taskRunsForPipelineRun(ctx, ref)
-		if err != nil {
-			p.log.Debug("waitForTaskRuns: list TaskRuns failed",
-				"err", err, "pipeline_run", ref.PipelineRunName,
-			)
-		} else if len(taskRuns) > 0 {
-			return taskRuns
-		}
-		// If the PipelineRun has already reached a terminal state and
-		// still has no TaskRuns, there's nothing more to wait for —
-		// return empty so the caller closes the stream cleanly.
-		if p.isPipelineRunTerminal(ctx, ref) {
-			p.log.Debug("waitForTaskRuns: PipelineRun terminal with no TaskRuns",
+		// Done condition: the PipelineRun is terminal AND we found no
+		// new TaskRuns this iteration. Both are required because a
+		// terminal PipelineRun can still expose a freshly-listed
+		// TaskRun whose pod we haven't drained yet.
+		if terminal && len(fresh) == 0 {
+			p.log.Debug("Logs: pipeline run terminal, no new TaskRuns",
 				"pipeline_run", ref.PipelineRunName,
 			)
-			return nil
+			return
 		}
+
+		// When we processed new TaskRuns this round, loop again
+		// immediately to re-list — Follow=true streaming may have
+		// blocked us long enough for additional TaskRuns or terminal
+		// transitions to have happened.
+		if len(fresh) > 0 {
+			continue
+		}
+
 		select {
 		case <-ctx.Done():
-			return nil
-		case <-time.After(interval):
+			return
+		case <-time.After(pollInterval):
 		}
 	}
 }
@@ -661,7 +706,12 @@ func (p *tektonProvider) fetchCompletedTaskRunLogs(
 			p.log.Debug("fetchCompletedTaskRunLogs: reading container logs",
 				"pod", pod.Name, "container", c.Name,
 			)
-			rc, err := p.client.StreamPodLogs(ctx, ref.Namespace, pod.Name, c.Name)
+			// Snapshot read (Follow=false) is correct here: the TaskRun
+			// has already terminated, so the API server has the full log
+			// available and there is nothing more to wait for.
+			rc, err := p.client.StreamPodLogs(ctx, ref.Namespace, pod.Name, c.Name,
+				k8s.LogOptions{Follow: false},
+			)
 			if err != nil {
 				p.log.Debug("fetchCompletedTaskRunLogs: stream failed", "err", err,
 					"pod", pod.Name, "container", c.Name,
@@ -720,7 +770,15 @@ func (p *tektonProvider) streamTaskRunLogs(
 			p.log.Debug("streamTaskRunLogs: streaming container",
 				"pod", pod.Name, "container", c.Name, "step_id", stepID,
 			)
-			rc, err := p.client.StreamPodLogs(ctx, ref.Namespace, pod.Name, c.Name)
+			// Live tail with Follow=true: the apiserver holds the
+			// connection open until the container terminates (or ctx is
+			// cancelled), so sendReaderLines only returns once the
+			// container is actually done. Without this, the read EOFs at
+			// the current tail position and the caller emits a spurious
+			// StepStatusEnd while the step is still running.
+			rc, err := p.client.StreamPodLogs(ctx, ref.Namespace, pod.Name, c.Name,
+				k8s.LogOptions{Follow: true},
+			)
 			if err != nil {
 				p.log.Debug("streamTaskRunLogs: stream pod logs failed", "err", err,
 					"pod", pod.Name, "container", c.Name,
