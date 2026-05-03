@@ -9,6 +9,13 @@ Tekton Triggers are intentionally not used. Tack already performs the
 event-to-run translation, and Tekton's native execution object is the
 `PipelineRun`.
 
+> [!IMPORTANT]
+>
+> **This is a community-contributed provider.** I (mitchellh) haven't
+> verified its functionality beyond what others have said worked. I've
+> only reviewed the code for obvious issues and to ensure it doesn't do
+> anything to jeopardize the rest of Tack.
+
 ## Required cluster setup
 
 * Tekton Pipelines is installed in the cluster.
