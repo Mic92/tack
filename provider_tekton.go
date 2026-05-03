@@ -465,26 +465,45 @@ func (p *tektonProvider) Logs(
 		return nil, fmt.Errorf("lookup tekton run mapping: %w", err)
 	}
 	if ref == nil {
+		// No mapping at all means this provider never spawned a
+		// PipelineRun for the requested tuple, so a 404 is the
+		// honest answer.
 		return nil, ErrLogsNotFound
 	}
 
-	taskRuns, err := p.taskRunsForPipelineRun(ctx, *ref)
-	if err != nil {
-		return nil, err
-	}
-	p.log.Debug("Logs: found TaskRuns for PipelineRun",
-		"pipeline_run", ref.PipelineRunName, "count", len(taskRuns),
-	)
-	if len(taskRuns) == 0 {
-		return nil, ErrLogsNotFound
-	}
-
-	terminal := p.isPipelineRunTerminal(ctx, *ref)
-	p.log.Debug("Logs: pipeline run terminal state", "pipeline_run", ref.PipelineRunName, "terminal", terminal)
-
+	// At this point the workflow *was* spawned — we have a row in the
+	// store mapping the tuple to a PipelineRun. The TaskRuns the
+	// PipelineRun fans out to are created asynchronously by Tekton
+	// once the run is admitted, so a freshly-spawned or still-queueing
+	// PipelineRun will momentarily report zero TaskRuns. Returning
+	// ErrLogsNotFound here would mistranslate that into a 404 at the
+	// HTTP layer (see provider.go contract: ErrLogsNotFound means the
+	// workflow never ran), making just-spawned runs look nonexistent
+	// to the appview. Instead, hand back an open channel and poll
+	// inside the goroutine until TaskRuns materialize, ctx is
+	// cancelled, or the PipelineRun reaches a terminal state with
+	// nothing to stream.
 	out := make(chan LogLine, 32)
 	go func() {
 		defer close(out)
+
+		taskRuns := p.waitForTaskRuns(ctx, *ref)
+		if len(taskRuns) == 0 {
+			// Either ctx was cancelled, or the PipelineRun
+			// reached a terminal state without ever scheduling
+			// any TaskRuns. Both cases close an empty stream;
+			// there's nothing to send.
+			return
+		}
+		p.log.Debug("Logs: found TaskRuns for PipelineRun",
+			"pipeline_run", ref.PipelineRunName, "count", len(taskRuns),
+		)
+
+		terminal := p.isPipelineRunTerminal(ctx, *ref)
+		p.log.Debug("Logs: pipeline run terminal state",
+			"pipeline_run", ref.PipelineRunName, "terminal", terminal,
+		)
+
 		stepID := 0
 		for _, tr := range taskRuns {
 			taskName := tr.GetName()
@@ -523,6 +542,44 @@ func (p *tektonProvider) Logs(
 		p.log.Debug("Logs: all TaskRuns streamed", "pipeline_run", ref.PipelineRunName)
 	}()
 	return out, nil
+}
+
+// waitForTaskRuns blocks until at least one TaskRun belonging to the
+// PipelineRun in ref is observable, the PipelineRun reaches a terminal
+// state with no TaskRuns, or ctx is cancelled. It exists so Logs can
+// keep the channel open across the gap between PipelineRun creation
+// and Tekton scheduling its TaskRuns, instead of mistranslating that
+// gap into a 404. The first iteration always probes immediately so a
+// PipelineRun that already has TaskRuns is returned without waiting.
+func (p *tektonProvider) waitForTaskRuns(
+	ctx context.Context,
+	ref TektonRunRef,
+) []k8s.Object {
+	const interval = 1 * time.Second
+	for {
+		taskRuns, err := p.taskRunsForPipelineRun(ctx, ref)
+		if err != nil {
+			p.log.Debug("waitForTaskRuns: list TaskRuns failed",
+				"err", err, "pipeline_run", ref.PipelineRunName,
+			)
+		} else if len(taskRuns) > 0 {
+			return taskRuns
+		}
+		// If the PipelineRun has already reached a terminal state and
+		// still has no TaskRuns, there's nothing more to wait for —
+		// return empty so the caller closes the stream cleanly.
+		if p.isPipelineRunTerminal(ctx, ref) {
+			p.log.Debug("waitForTaskRuns: PipelineRun terminal with no TaskRuns",
+				"pipeline_run", ref.PipelineRunName,
+			)
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-time.After(interval):
+		}
+	}
 }
 
 // isPipelineRunTerminal returns true if the PipelineRun is in a terminal state right now.

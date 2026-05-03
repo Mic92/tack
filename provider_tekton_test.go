@@ -198,8 +198,42 @@ func TestTektonLogsLookup(t *testing.T) {
 	if err := st.InsertTektonRun(ctx, ref); err != nil {
 		t.Fatalf("insert ref: %v", err)
 	}
-	if _, err := p.Logs(ctx, "knot.example.com", "rkey-1", "ci.yml"); !errors.Is(err, ErrLogsNotFound) {
-		t.Fatalf("logs before TaskRuns err = %v; want ErrLogsNotFound", err)
+	// With the mapping in place but no TaskRuns yet, Logs must NOT
+	// return ErrLogsNotFound: the workflow has been spawned and is
+	// just queueing inside Tekton. Surfacing 404 here mistranslates
+	// "still scheduling" as "doesn't exist" at the HTTP layer (see
+	// http.go's /logs handler). Verify we get an open channel that
+	// stays open until ctx is cancelled.
+	{
+		waitCtx, cancel := context.WithCancel(ctx)
+		ch, err := p.Logs(waitCtx, "knot.example.com", "rkey-1", "ci.yml")
+		if err != nil {
+			cancel()
+			t.Fatalf("logs before TaskRuns err = %v; want nil", err)
+		}
+		if ch == nil {
+			cancel()
+			t.Fatalf("logs before TaskRuns: nil channel")
+		}
+		// Channel must not produce any frames or close before we
+		// cancel. A premature close would mean the goroutine treated
+		// "no TaskRuns yet" as "stream done", which is what we just
+		// fixed.
+		select {
+		case line, ok := <-ch:
+			cancel()
+			if !ok {
+				t.Fatalf("logs channel closed before TaskRuns appeared")
+			}
+			t.Fatalf("unexpected frame before TaskRuns: %+v", line)
+		case <-time.After(50 * time.Millisecond):
+		}
+		cancel()
+		// After cancellation the producer goroutine must close the
+		// channel and not strand any frames.
+		for line := range ch {
+			t.Fatalf("unexpected frame after cancel: %+v", line)
+		}
 	}
 
 	client.SeedObject(taskRunsGVR, "ci", k8s.Object{
