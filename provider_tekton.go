@@ -69,6 +69,7 @@ type tektonWorkspaceConfig struct {
 	Storage     *string  `yaml:"storage"`
 	PVC         *string  `yaml:"pvc"`
 	Secret      *string  `yaml:"secret"`
+	ConfigMap   *string  `yaml:"config_map"`
 }
 
 type tektonWorkflowDoc struct {
@@ -312,6 +313,14 @@ func buildTektonPipelineRun(
 					"name": ws.Name,
 					"secret": map[string]any{
 						"secretName": *ws.Secret,
+					},
+				})
+
+			case ws.ConfigMap != nil:
+				workspaces = append(workspaces, map[string]any{
+					"name": ws.Name,
+					"configMap": map[string]any{
+						"name": *ws.ConfigMap,
 					},
 				})
 			}

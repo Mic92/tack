@@ -82,12 +82,14 @@ func TestTektonBuildPipelineRunWorkspaces(t *testing.T) {
 	storage := "5Gi"
 	pvc := "shared-cache"
 	secret := "git-credentials"
+	configMap := "app-config"
 	cfg := &tektonWorkflowConfig{
 		Pipeline: "repo-ci",
 		Workspaces: []tektonWorkspaceConfig{
 			{Name: "scratch", AccessModes: []string{"ReadWriteOnce"}, Storage: &storage},
 			{Name: "cache", PVC: &pvc},
 			{Name: "git-auth", Secret: &secret},
+			{Name: "config", ConfigMap: &configMap},
 		},
 	}
 
@@ -106,7 +108,7 @@ func TestTektonBuildPipelineRunWorkspaces(t *testing.T) {
 	}
 
 	workspaces, ok := obj.NestedSlice("spec", "workspaces")
-	if !ok || len(workspaces) != 3 {
+	if !ok || len(workspaces) != 4 {
 		t.Fatalf("workspaces = %+v", workspaces)
 	}
 
@@ -138,6 +140,15 @@ func TestTektonBuildPipelineRunWorkspaces(t *testing.T) {
 	secretRef, ok := k8s.NestedMap(gitAuth, "secret")
 	if !ok || secretRef["secretName"] != "git-credentials" {
 		t.Fatalf("git-auth secret = %+v", gitAuth)
+	}
+
+	cfgWs, ok := workspaces[3].(map[string]any)
+	if !ok {
+		t.Fatalf("config workspace = %#v", workspaces[3])
+	}
+	cmRef, ok := k8s.NestedMap(cfgWs, "configMap")
+	if !ok || cmRef["name"] != "app-config" {
+		t.Fatalf("config configMap = %+v", cfgWs)
 	}
 }
 
