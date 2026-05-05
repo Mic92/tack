@@ -78,6 +78,69 @@ func TestTektonBuildPipelineRun(t *testing.T) {
 	}
 }
 
+func TestTektonBuildPipelineRunWorkspaces(t *testing.T) {
+	storage := "5Gi"
+	pvc := "shared-cache"
+	secret := "git-credentials"
+	cfg := &tektonWorkflowConfig{
+		Pipeline: "repo-ci",
+		Workspaces: []tektonWorkspaceConfig{
+			{Name: "scratch", AccessModes: []string{"ReadWriteOnce"}, Storage: &storage},
+			{Name: "cache", PVC: &pvc},
+			{Name: "git-auth", Secret: &secret},
+		},
+	}
+
+	obj := buildTektonPipelineRun("ci", "run-1", cfg,
+		"knot.example.com", "rkey-1", "did:plc:actor", "abcdef", "main",
+		&tangled.Pipeline_Workflow{Name: "ci.yml"},
+	)
+
+	podTemplate, ok := obj.NestedMap("spec", "podTemplate")
+	if !ok {
+		t.Fatal("podTemplate missing for workspace-backed PipelineRun")
+	}
+	fsGroup, ok := k8s.NestedMap(podTemplate, "securityContext")
+	if !ok || fsGroup["fsGroup"] != 65532 {
+		t.Fatalf("podTemplate.securityContext = %+v", podTemplate)
+	}
+
+	workspaces, ok := obj.NestedSlice("spec", "workspaces")
+	if !ok || len(workspaces) != 3 {
+		t.Fatalf("workspaces = %+v", workspaces)
+	}
+
+	scratch, ok := workspaces[0].(map[string]any)
+	if !ok {
+		t.Fatalf("scratch workspace = %#v", workspaces[0])
+	}
+	if scratch["name"] != "scratch" {
+		t.Fatalf("scratch.name = %#v", scratch["name"])
+	}
+	storageSpec, ok := k8s.NestedMap(scratch, "volumeClaimTemplate", "spec", "resources", "requests")
+	if !ok || storageSpec["storage"] != "5Gi" {
+		t.Fatalf("scratch volumeClaimTemplate = %+v", scratch)
+	}
+
+	cache, ok := workspaces[1].(map[string]any)
+	if !ok {
+		t.Fatalf("cache workspace = %#v", workspaces[1])
+	}
+	claim, ok := k8s.NestedMap(cache, "persistentVolumeClaim")
+	if !ok || claim["claimName"] != "shared-cache" {
+		t.Fatalf("cache persistentVolumeClaim = %+v", cache)
+	}
+
+	gitAuth, ok := workspaces[2].(map[string]any)
+	if !ok {
+		t.Fatalf("git-auth workspace = %#v", workspaces[2])
+	}
+	secretRef, ok := k8s.NestedMap(gitAuth, "secret")
+	if !ok || secretRef["secretName"] != "git-credentials" {
+		t.Fatalf("git-auth secret = %+v", gitAuth)
+	}
+}
+
 func TestTektonStatusMapping(t *testing.T) {
 	tests := []struct {
 		name     string

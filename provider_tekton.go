@@ -68,6 +68,7 @@ type tektonWorkspaceConfig struct {
 	AccessModes []string `yaml:"access_modes"`
 	Storage     *string  `yaml:"storage"`
 	PVC         *string  `yaml:"pvc"`
+	Secret      *string  `yaml:"secret"`
 }
 
 type tektonWorkflowDoc struct {
@@ -303,6 +304,14 @@ func buildTektonPipelineRun(
 					"name": ws.Name,
 					"persistentVolumeClaim": map[string]any{
 						"claimName": *ws.PVC,
+					},
+				})
+
+			case ws.Secret != nil:
+				workspaces = append(workspaces, map[string]any{
+					"name": ws.Name,
+					"secret": map[string]any{
+						"secretName": *ws.Secret,
 					},
 				})
 			}
