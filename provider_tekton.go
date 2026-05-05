@@ -57,9 +57,17 @@ var (
 // runner and pass a small amount of routing data, not mirror Tekton's
 // entire PipelineRun API.
 type tektonWorkflowConfig struct {
-	Pipeline       string            `yaml:"pipeline"`
-	ServiceAccount string            `yaml:"service_account"`
-	Params         map[string]string `yaml:"params"`
+	Pipeline       string                  `yaml:"pipeline"`
+	ServiceAccount string                  `yaml:"service_account"`
+	Params         map[string]string       `yaml:"params"`
+	Workspaces     []tektonWorkspaceConfig `yaml:"workspaces"`
+}
+
+type tektonWorkspaceConfig struct {
+	Name        string   `yaml:"name"`
+	AccessModes []string `yaml:"access_modes"`
+	Storage     *string  `yaml:"storage"`
+	PVC         *string  `yaml:"pvc"`
 }
 
 type tektonWorkflowDoc struct {
@@ -261,7 +269,48 @@ func buildTektonPipelineRun(
 			},
 		},
 	}
+
 	spec := obj["spec"].(map[string]any)
+
+	if len(cfg.Workspaces) != 0 {
+		spec["podTemplate"] = map[string]any{
+			"securityContext": map[string]any{
+				"fsGroup": 65532,
+			},
+		}
+
+		workspaces := []any{}
+
+		for _, ws := range cfg.Workspaces {
+			switch {
+			case ws.Storage != nil:
+				workspaces = append(workspaces, map[string]any{
+					"name": ws.Name,
+					"volumeClaimTemplate": map[string]any{
+						"spec": map[string]any{
+							"accessModes": ws.AccessModes,
+							"resources": map[string]any{
+								"requests": map[string]any{
+									"storage": *ws.Storage,
+								},
+							},
+						},
+					},
+				})
+
+			case ws.PVC != nil:
+				workspaces = append(workspaces, map[string]any{
+					"name": ws.Name,
+					"persistentVolumeClaim": map[string]any{
+						"claimName": *ws.PVC,
+					},
+				})
+			}
+		}
+
+		spec["workspaces"] = workspaces
+	}
+
 	if cfg.ServiceAccount != "" {
 		spec["serviceAccountName"] = cfg.ServiceAccount
 	}
