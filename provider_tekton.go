@@ -245,6 +245,20 @@ func buildTektonPipelineRun(
 			"pipelineRef": map[string]any{
 				"name": cfg.Pipeline,
 			},
+			"params": []any{
+				map[string]any{
+					"name":  "commit",
+					"value": commit,
+				},
+				map[string]any{
+					"name":  "branch",
+					"value": branch,
+				},
+				map[string]any{
+					"name":  "actor",
+					"value": actor,
+				},
+			},
 		},
 	}
 	spec := obj["spec"].(map[string]any)
