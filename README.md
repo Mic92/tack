@@ -24,8 +24,7 @@ when:
   - event: ["pull_request"]
     branch: ["main"]
 
-# this does nothing for Tack but is required by Tangled
-engine: nixery
+engine: tack
 
 tack:
   buildkite:

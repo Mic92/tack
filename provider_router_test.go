@@ -100,8 +100,8 @@ func TestProviderRouterSpawnRoutesByYAMLKey(t *testing.T) {
 
 	r.Spawn(context.Background(), "knot", "rkey", "did:plc:actor", nil,
 		[]*tangled.Pipeline_Workflow{
-			{Name: "wf-a.yml", Raw: "tack:\n  a: {}\n"},
-			{Name: "wf-b.yml", Raw: "tack:\n  b: {}\n"},
+			{Name: "wf-a.yml", Engine: "tack", Raw: "tack:\n  a: {}\n"},
+			{Name: "wf-b.yml", Engine: "tack", Raw: "tack:\n  b: {}\n"},
 		},
 	)
 
@@ -123,7 +123,7 @@ func TestProviderRouterSpawnFirstYAMLKeyWins(t *testing.T) {
 	// workflow even though both keys are registered.
 	r.Spawn(context.Background(), "knot", "rkey", "did:plc:actor", nil,
 		[]*tangled.Pipeline_Workflow{
-			{Name: "both.yml", Raw: "tack:\n  b: {}\n  a: {}\n"},
+			{Name: "both.yml", Engine: "tack", Raw: "tack:\n  b: {}\n  a: {}\n"},
 		},
 	)
 
@@ -144,13 +144,13 @@ func TestProviderRouterSpawnSkipsUnroutable(t *testing.T) {
 	r.Spawn(context.Background(), "knot", "rkey", "did:plc:actor", nil,
 		[]*tangled.Pipeline_Workflow{
 			// No `tack:` key at all.
-			{Name: "bare.yml", Raw: "steps: []\n"},
+			{Name: "bare.yml", Engine: "tack", Raw: "steps: []\n"},
 			// `tack:` present but with an unknown sub-key.
-			{Name: "unknown.yml", Raw: "tack:\n  nope: {}\n"},
+			{Name: "unknown.yml", Engine: "tack", Raw: "tack:\n  nope: {}\n"},
 			// Empty body — also unroutable.
-			{Name: "empty.yml", Raw: ""},
+			{Name: "empty.yml", Engine: "tack", Raw: ""},
 			// And one good one to prove the loop kept going.
-			{Name: "good.yml", Raw: "tack:\n  a: {}\n"},
+			{Name: "good.yml", Engine: "tack", Raw: "tack:\n  a: {}\n"},
 		},
 	)
 
@@ -159,6 +159,28 @@ func TestProviderRouterSpawnSkipsUnroutable(t *testing.T) {
 	}
 	if got := b.names(); len(got) != 0 {
 		t.Fatalf("provider b should not have been called; got %v", got)
+	}
+}
+
+// TestProviderRouterSpawnRejectsWrongEngine verifies that workflows
+// without `engine: tack` are skipped.
+func TestProviderRouterSpawnRejectsWrongEngine(t *testing.T) {
+	r, a, b := newRouterTest()
+
+	r.Spawn(context.Background(), "knot", "rkey", "did:plc:actor", nil,
+		[]*tangled.Pipeline_Workflow{
+			{Name: "wrong-engine.yml", Engine: "nixery", Raw: "tack:\n  a: {}\n"},
+			{Name: "empty-engine.yml", Engine: "", Raw: "tack:\n  a: {}\n"},
+			{Name: "correct.yml", Engine: "tack", Raw: "tack:\n  b: {}\n"},
+		},
+	)
+
+	// Only "correct.yml" should reach a provider
+	if got := a.names(); len(got) != 0 {
+		t.Fatalf("provider a should not have been called; got %v", got)
+	}
+	if got, want := b.names(), []string{"correct.yml"}; !equalStrings(got, want) {
+		t.Fatalf("provider b got %v; want %v", got, want)
 	}
 }
 

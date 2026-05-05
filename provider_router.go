@@ -69,6 +69,15 @@ func (r *providerRouter) Spawn(
 		if wf == nil || wf.Name == "" {
 			continue
 		}
+		if wf.Engine != "tack" {
+			r.log.Error("workflow has wrong engine",
+				"err", fmt.Sprintf("expected engine %q, got %q", "tack", wf.Engine),
+				"knot", knot,
+				"pipeline_rkey", pipelineRkey,
+				"workflow", wf.Name,
+			)
+			continue
+		}
 		p, err := r.pick(wf.Raw)
 		if err != nil {
 			r.log.Error("route workflow",
