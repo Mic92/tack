@@ -110,3 +110,4 @@ its own doc per provider:
 
 * [Buildkite](docs/buildkite.md)
 * [Tekton](docs/tekton.md)
+* [sourcehut](docs/sourcehut.md)
