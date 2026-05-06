@@ -31,3 +31,17 @@ steps:
     command: |
       nix build .#tack
       ./result/bin/tack -h
+
+  - label: ":docker: image build & smoke"
+    # Keep the community Dockerfile from drifting away from the real build.
+    # The image smoke test mirrors the Nix package smoke test: `tack -h` exits
+    # before env-var validation, so it proves the container starts without
+    # needing a database, Tangled credentials, or a live HTTP listener.
+    #
+    # Buildkite's Docker builder may be a remote BuildKit driver, so `--load`
+    # makes the tagged image available to the local daemon for `docker run`.
+    # `--quiet` also keeps the layer transfer logs below Buildkite's display
+    # limit while still surfacing a failing Dockerfile command.
+    command: |
+      docker build --pull --load --quiet --file docker/tack.Dockerfile --tag tack:ci .
+      docker run --rm tack:ci /app/bin/tack -h

@@ -1,0 +1,6 @@
+.git
+.jj
+.direnv
+result
+tack
+tack.db*
