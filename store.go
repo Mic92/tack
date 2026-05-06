@@ -541,6 +541,23 @@ type TektonRunRef struct {
 	PipelineURI     string
 }
 
+// SourcehutJobRef is the persisted link from a Tangled workflow tuple
+// to the builds.sr.ht job tack submitted for it. Owner is the
+// canonical name (with leading "~") returned by the upstream API and
+// is the path component log URLs are rooted at — without it we can't
+// fetch logs even though the job ID alone is unique. Instance is the
+// base URL the job lives on; persisted per-row so post-creation API
+// calls always target the same server the workflow originally ran on.
+type SourcehutJobRef struct {
+	Knot         string
+	PipelineRkey string
+	Workflow     string
+	JobID        int64
+	Owner        string
+	Instance     string
+	PipelineURI  string
+}
+
 // InsertBuildkiteBuild records that a Buildkite build was created on
 // behalf of the given (knot, pipelineRkey, workflow) tuple. Uses
 // INSERT OR REPLACE so that an unlikely build-uuid collision (or a
@@ -670,6 +687,58 @@ func (s *store) InsertTektonRun(ctx context.Context, ref TektonRunRef) error {
 		return fmt.Errorf("insert tekton_run: %w", err)
 	}
 	return nil
+}
+
+// InsertSourcehutJob records the latest builds.sr.ht job submitted for
+// a Tangled workflow tuple. Reusing the tuple as the primary key
+// intentionally makes /logs resolve to the newest job for that workflow
+// identity — same behaviour as InsertTektonRun.
+func (s *store) InsertSourcehutJob(ctx context.Context, ref SourcehutJobRef) error {
+	now := time.Now().UTC()
+	_, err := s.db.ExecContext(ctx,
+		`INSERT INTO sourcehut_jobs (
+            knot, pipeline_rkey, workflow,
+            job_id, owner, instance,
+            pipeline_uri, created_at, created_unix_ns
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(knot, pipeline_rkey, workflow) DO UPDATE SET
+             job_id          = excluded.job_id,
+             owner           = excluded.owner,
+             instance        = excluded.instance,
+             pipeline_uri    = excluded.pipeline_uri,
+             created_at      = excluded.created_at,
+             created_unix_ns = excluded.created_unix_ns`,
+		ref.Knot, ref.PipelineRkey, ref.Workflow,
+		ref.JobID, ref.Owner, ref.Instance,
+		ref.PipelineURI, now.Format(time.RFC3339Nano), now.UnixNano(),
+	)
+	if err != nil {
+		return fmt.Errorf("insert sourcehut_job: %w", err)
+	}
+	return nil
+}
+
+// LookupSourcehutJobByTuple resolves the appview's path-based identity
+// back to the concrete builds.sr.ht job tack submitted for it.
+func (s *store) LookupSourcehutJobByTuple(ctx context.Context, knot, pipelineRkey, workflow string) (*SourcehutJobRef, error) {
+	var ref SourcehutJobRef
+	err := s.db.QueryRowContext(ctx,
+		`SELECT knot, pipeline_rkey, workflow,
+                job_id, owner, instance, pipeline_uri
+           FROM sourcehut_jobs
+          WHERE knot = ? AND pipeline_rkey = ? AND workflow = ?`,
+		knot, pipelineRkey, workflow,
+	).Scan(
+		&ref.Knot, &ref.PipelineRkey, &ref.Workflow,
+		&ref.JobID, &ref.Owner, &ref.Instance, &ref.PipelineURI,
+	)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("lookup sourcehut_job by tuple: %w", err)
+	}
+	return &ref, nil
 }
 
 // LookupTektonRunByTuple resolves the appview's path-based identity to

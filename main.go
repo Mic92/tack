@@ -52,6 +52,14 @@ type config struct {
 	// TektonNamespace using its pod's service account credentials.
 	TektonEnabled   bool
 	TektonNamespace string
+
+	// Sourcehut mode is gated on a token: when empty the provider is
+	// not registered and workflows naming `tack.sourcehut` route
+	// nowhere. SourcehutInstance overrides the public builds.sr.ht
+	// endpoint for users running their own deployment; the token must
+	// authenticate against whichever instance is targeted.
+	SourcehutToken    string
+	SourcehutInstance string
 }
 
 func loadConfig() (config, error) {
@@ -68,8 +76,10 @@ func loadConfig() (config, error) {
 		BuildkiteWebhookMode: buildkite.WebhookMode(
 			envOr("TACK_BUILDKITE_WEBHOOK_MODE", string(buildkite.WebhookModeToken)),
 		),
-		TektonEnabled:   os.Getenv("TACK_TEKTON_ENABLED") == "1",
-		TektonNamespace: envOr("TACK_TEKTON_NAMESPACE", "default"),
+		TektonEnabled:     os.Getenv("TACK_TEKTON_ENABLED") == "1",
+		TektonNamespace:   envOr("TACK_TEKTON_NAMESPACE", "default"),
+		SourcehutToken:    os.Getenv("TACK_SOURCEHUT_TOKEN"),
+		SourcehutInstance: os.Getenv("TACK_SOURCEHUT_INSTANCE"),
 	}
 	addrFlag := flag.String("addr", cfg.Addr, "HTTP listen address (overrides TACK_LISTEN_ADDR)")
 	flag.Parse()
@@ -215,6 +225,18 @@ func main() {
 		providers["tekton"] = tkProvider
 		logger.Info("tekton provider enabled",
 			"namespace", cfg.TektonNamespace,
+		)
+	}
+	if cfg.SourcehutToken != "" {
+		shProvider := newSourcehutProvider(
+			br, st,
+			cfg.SourcehutToken,
+			cfg.SourcehutInstance,
+			logger,
+		)
+		providers["sourcehut"] = shProvider
+		logger.Info("sourcehut provider enabled",
+			"instance", shProvider.defaultInstance,
 		)
 	}
 	provider := newProviderRouter(logger, providers)

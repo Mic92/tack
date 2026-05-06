@@ -142,6 +142,29 @@ CREATE TABLE IF NOT EXISTS tekton_runs (
 );
 CREATE INDEX IF NOT EXISTS tekton_runs_uid
     ON tekton_runs (pipeline_run_uid);
+
+-- Mapping from a Tangled workflow tuple to the latest builds.sr.ht
+-- job tack submitted for it. Same shape as tekton_runs: like Tekton,
+-- sourcehut is observed by polling rather than webhooks, so the read
+-- path is purely tuple → job_id resolution at /logs and watch time.
+-- instance is the builds.sr.ht-compatible base URL the job lives on
+-- (job IDs are scoped to one instance), preserved per-row so a later
+-- change to the provider's default instance can't silently retarget
+-- historical lookups at the wrong server.
+CREATE TABLE IF NOT EXISTS sourcehut_jobs (
+    knot            TEXT NOT NULL,
+    pipeline_rkey   TEXT NOT NULL,
+    workflow        TEXT NOT NULL,
+    job_id          INTEGER NOT NULL,
+    owner           TEXT NOT NULL,
+    instance        TEXT NOT NULL,
+    pipeline_uri    TEXT NOT NULL,
+    created_at      TEXT NOT NULL,
+    created_unix_ns INTEGER NOT NULL,
+    PRIMARY KEY (knot, pipeline_rkey, workflow)
+);
+CREATE INDEX IF NOT EXISTS sourcehut_jobs_id
+    ON sourcehut_jobs (job_id);
 `
 
 // migrate applies the schema. Safe to call repeatedly.
