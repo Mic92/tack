@@ -383,6 +383,25 @@ func (p *sourcehutProvider) Logs(
 		return nil, fmt.Errorf("get sourcehut job: %w", err)
 	}
 
+	// Probe the master log up front to detect a systemic
+	// authorization failure (typically a token that lacks
+	// `builds.sr.ht/LOGS:RO`). Without this check, every per-task
+	// fetch in the goroutine below would 403 and `streamStep` would
+	// emit empty steps — leaving the operator with builds whose
+	// status updates correctly but whose logs are silently blank.
+	// ErrNotFound here is fine: the runner just hasn't produced any
+	// setup output yet.
+	if _, err := client.GetTaskLog(ctx, ref.JobID, ""); err != nil &&
+		!errors.Is(err, sourcehut.ErrNotFound) {
+		if errors.Is(err, sourcehut.ErrUnauthorized) {
+			return nil, fmt.Errorf(
+				"sourcehut log fetch unauthorized; "+
+					"token likely missing `builds.sr.ht/LOGS:RO`: %w", err,
+			)
+		}
+		return nil, fmt.Errorf("probe sourcehut task log: %w", err)
+	}
+
 	out := make(chan LogLine, 32)
 	go func() {
 		defer close(out)
@@ -429,6 +448,18 @@ func (p *sourcehutProvider) streamStep(
 	}
 	body, err := client.GetTaskLog(ctx, ref.JobID, logTask)
 	if err != nil && !errors.Is(err, sourcehut.ErrNotFound) {
+		if errors.Is(err, sourcehut.ErrUnauthorized) {
+			// Auth errors are systemic — every subsequent task fetch
+			// will fail the same way. Log loudly and abort the stream
+			// so the operator notices instead of getting a build with
+			// every step rendered empty. The HTTP layer can't change
+			// status mid-stream, but at least the server log will
+			// point straight at the misconfigured token.
+			p.log.Error("sourcehut log fetch unauthorized; aborting stream",
+				"err", err, "job_id", ref.JobID, "task", logTask,
+			)
+			return false
+		}
 		// Don't fail the whole stream on one task; emit the end frame
 		// and move on so the renderer at least sees what other tasks
 		// produced. ErrNotFound (no log yet) is treated as an empty body.

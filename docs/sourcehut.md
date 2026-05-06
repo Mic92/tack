@@ -13,9 +13,14 @@ each transition.
 | `TACK_SOURCEHUT_TOKEN`  | Personal access token for builds.sr.ht (enables provider) |
 | `TACK_SOURCEHUT_INSTANCE` | Base URL override (default `https://builds.sr.ht`)   |
 
-Generate a token at `https://meta.sr.ht/oauth2/personal-token` with
-`builds.sr.ht/JOBS:RW` access, set the `TACK_SOURCEHUT_TOKEN=$token` env var,
-then start tack.
+Generate a token at `https://meta.sr.ht/oauth2/personal-token` with both
+`builds.sr.ht/JOBS:RW` and `builds.sr.ht/LOGS:RO` access, set the
+`TACK_SOURCEHUT_TOKEN=$token` env var, then start tack.
+
+`JOBS:RW` is required to submit jobs and poll their status. `LOGS:RO`
+is required because tack fetches per-task logs over an authenticated
+HTTP endpoint when serving the appview's log stream — without it the
+build will run to completion but every log request will fail.
 
 ## Workflow YAML
 

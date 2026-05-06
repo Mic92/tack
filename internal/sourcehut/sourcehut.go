@@ -27,6 +27,14 @@ const DefaultBaseURL = "https://builds.sr.ht"
 // for the /logs handler.
 var ErrNotFound = errors.New("sourcehut: not found")
 
+// ErrUnauthorized is returned by Get* methods when the upstream rejects
+// the request with 401/403 — most commonly because the configured
+// personal access token is missing the requisite scope (e.g. the log
+// endpoints require `builds.sr.ht/LOGS:RO`). It's distinct from
+// ErrNotFound so callers can surface a systemic auth misconfiguration
+// instead of silently treating it as "no logs yet".
+var ErrUnauthorized = errors.New("sourcehut: unauthorized")
+
 // Client is a thin wrapper around net/http carrying API credentials
 // and the target instance base URL. Safe for concurrent use; the
 // embedded http.Client is goroutine-safe.
@@ -198,6 +206,18 @@ func (c *Client) GetTaskLog(ctx context.Context, jobID int64, taskName string) (
 	defer resp.Body.Close()
 	if resp.StatusCode == http.StatusNotFound {
 		return "", ErrNotFound
+	}
+	if resp.StatusCode == http.StatusUnauthorized ||
+		resp.StatusCode == http.StatusForbidden {
+		// Surface auth failures distinctly so callers can stop the
+		// log stream loudly rather than silently emitting empty
+		// steps for every task. The most common cause is a token
+		// missing `builds.sr.ht/LOGS:RO`.
+		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		return "", fmt.Errorf("get task log: status %d: %s: %w",
+			resp.StatusCode, strings.TrimSpace(string(raw)),
+			ErrUnauthorized,
+		)
 	}
 	if resp.StatusCode != http.StatusOK {
 		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
