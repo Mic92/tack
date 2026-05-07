@@ -89,8 +89,46 @@ func parseTektonWorkflowConfig(raw string) (*tektonWorkflowConfig, error) {
 	}
 	cfg := doc.Tack.Tekton
 	if cfg.Pipeline == "" {
-		return nil, errors.New("workflow yaml: `tack.tekton.pipeline` is required")
+		return nil, errors.New(
+			"workflow yaml: `tack.tekton.pipeline` is required",
+		)
 	}
+
+	// Validate workspaces: each must have exactly one volume source
+	// so the resulting PipelineRun is unambiguous. Without this,
+	// a workspace with e.g. both `storage` and `pvc` set silently
+	// picks whichever the switch statement matches first.
+	for _, ws := range cfg.Workspaces {
+		if ws.Name == "" {
+			return nil, errors.New("workspace: name is required")
+		}
+		sources := 0
+		if ws.Storage != nil {
+			sources++
+		}
+		if ws.PVC != nil {
+			sources++
+		}
+		if ws.Secret != nil {
+			sources++
+		}
+		if ws.ConfigMap != nil {
+			sources++
+		}
+		if sources == 0 {
+			return nil, fmt.Errorf(
+				"workspace %q: no volume source specified", ws.Name,
+			)
+		}
+		if sources > 1 {
+			return nil, fmt.Errorf(
+				"workspace %q: multiple volume sources specified"+
+					" (pick one of storage, pvc, secret, config_map)",
+				ws.Name,
+			)
+		}
+	}
+
 	return &cfg, nil
 }
 

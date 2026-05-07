@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"log/slog"
+	"strings"
 	"testing"
 	"time"
 
@@ -37,6 +38,54 @@ func TestTektonWorkflowConfig(t *testing.T) {
 
 	if _, err := parseTektonWorkflowConfig("tack:\n  tekton: {}\n"); err == nil {
 		t.Fatal("missing pipeline should fail")
+	}
+}
+
+func TestTektonWorkspaceValidation(t *testing.T) {
+	tests := []struct {
+		name    string
+		yaml    string
+		wantErr string
+	}{
+		{
+			name:    "empty name",
+			yaml:    "tack:\n  tekton:\n    pipeline: ci\n    workspaces:\n      - storage: 1Gi\n",
+			wantErr: "name is required",
+		},
+		{
+			name:    "no source",
+			yaml:    "tack:\n  tekton:\n    pipeline: ci\n    workspaces:\n      - name: scratch\n",
+			wantErr: "no volume source",
+		},
+		{
+			name:    "multiple sources",
+			yaml:    "tack:\n  tekton:\n    pipeline: ci\n    workspaces:\n      - name: data\n        storage: 5Gi\n        pvc: my-pvc\n",
+			wantErr: "multiple volume sources",
+		},
+		{
+			name: "valid single source",
+			yaml: "tack:\n  tekton:\n    pipeline: ci\n    workspaces:\n      - name: scratch\n        storage: 1Gi\n",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := parseTektonWorkflowConfig(tt.yaml)
+			if tt.wantErr == "" {
+				if err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatalf("expected error containing %q", tt.wantErr)
+			}
+			if !strings.Contains(err.Error(), tt.wantErr) {
+				t.Fatalf(
+					"error %q does not contain %q",
+					err.Error(), tt.wantErr,
+				)
+			}
+		})
 	}
 }
 
