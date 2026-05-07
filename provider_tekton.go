@@ -370,17 +370,38 @@ func buildTektonPipelineRun(
 	if cfg.ServiceAccount != "" {
 		spec["serviceAccountName"] = cfg.ServiceAccount
 	}
+
+	// Merge user-defined params with the built-in ones (commit,
+	// branch, actor). User params that collide with a built-in name
+	// win, so callers can override the defaults when the upstream
+	// Tekton Pipeline expects a different shape.
 	if len(cfg.Params) > 0 {
-		keys := make([]string, 0, len(cfg.Params))
-		for key := range cfg.Params {
+		builtins := map[string]string{
+			"commit": commit,
+			"branch": branch,
+			"actor":  actor,
+		}
+
+		// Collect all param names, user params override built-ins.
+		merged := make(map[string]string, len(builtins)+len(cfg.Params))
+		for k, v := range builtins {
+			merged[k] = v
+		}
+		for k, v := range cfg.Params {
+			merged[k] = v
+		}
+
+		keys := make([]string, 0, len(merged))
+		for key := range merged {
 			keys = append(keys, key)
 		}
 		sort.Strings(keys)
+
 		params := make([]any, 0, len(keys))
 		for _, key := range keys {
 			params = append(params, map[string]any{
 				"name":  key,
-				"value": cfg.Params[key],
+				"value": merged[key],
 			})
 		}
 		spec["params"] = params

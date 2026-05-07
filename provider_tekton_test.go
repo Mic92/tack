@@ -117,13 +117,52 @@ func TestTektonBuildPipelineRun(t *testing.T) {
 	if !ok || sa != "runner" {
 		t.Fatalf("serviceAccountName = %q", sa)
 	}
+	// With cfg.Params={"image": "example/app"}, the merged params
+	// should contain the 3 built-ins (actor, branch, commit) plus
+	// the user-supplied "image" — 4 total, sorted alphabetically.
 	params, ok := obj.NestedSlice("spec", "params")
-	if !ok || len(params) != 1 {
-		t.Fatalf("params = %+v", params)
+	if !ok || len(params) != 4 {
+		t.Fatalf("params count = %d, want 4: %+v", len(params), params)
 	}
 	if obj.GetAnnotations()[tektonAnnotationActor] != "did:plc:actor" ||
 		obj.GetAnnotations()[tektonAnnotationCommit] != "abcdef" {
 		t.Fatalf("annotations missing identity: %+v", obj.GetAnnotations())
+	}
+}
+
+func TestTektonBuildPipelineRunParamsOverride(t *testing.T) {
+	// When a user param collides with a built-in name, the user's
+	// value should win so callers can customize what the upstream
+	// Tekton Pipeline receives.
+	cfg := &tektonWorkflowConfig{
+		Pipeline: "repo-ci",
+		Params: map[string]string{
+			"commit": "user-override-sha",
+			"extra":  "bonus",
+		},
+	}
+	obj := buildTektonPipelineRun("ci", "run-1", cfg,
+		"knot.example.com", "rkey-1", "did:plc:actor",
+		"original-sha", "main",
+		&tangled.Pipeline_Workflow{Name: "ci.yml"},
+	)
+	params, ok := obj.NestedSlice("spec", "params")
+	if !ok {
+		t.Fatal("params missing")
+	}
+	// Expect 4: actor, branch, commit (overridden), extra.
+	if len(params) != 4 {
+		t.Fatalf("params count = %d, want 4: %+v", len(params), params)
+	}
+	// Verify the user override took effect.
+	for _, raw := range params {
+		p, _ := raw.(map[string]any)
+		if p["name"] == "commit" && p["value"] != "user-override-sha" {
+			t.Fatalf(
+				"commit param = %q, want user-override-sha",
+				p["value"],
+			)
+		}
 	}
 }
 
