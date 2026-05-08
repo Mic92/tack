@@ -22,4 +22,12 @@ RUN apt-get update \
 
 COPY --from=build /app/bin/tack /app/bin/tack
 
+LABEL org.opencontainers.image.title="Tack" \
+    org.opencontainers.image.description="Stitch any CI into Tangled" \
+    org.opencontainers.image.authors="Mitchell Hashimoto" \
+    org.opencontainers.image.source="https://tangled.org/mitchellh.com/tack" \
+    org.opencontainers.image.documentation="https://tangled.org/mitchellh.com/tack" \
+    org.opencontainers.image.licenses="MIT" \
+    io.atcr.readme="https://tangled.org/mitchellh.com/tack/raw/main/README.md"
+
 CMD ["/app/bin/tack"]
