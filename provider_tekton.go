@@ -368,7 +368,9 @@ func buildTektonPipelineRun(
 	}
 
 	if cfg.ServiceAccount != "" {
-		spec["serviceAccountName"] = cfg.ServiceAccount
+		spec["taskRunTemplate"] = map[string]any{
+			"serviceAccountName": cfg.ServiceAccount,
+		}
 	}
 
 	// Merge user-defined params with the built-in ones (commit,

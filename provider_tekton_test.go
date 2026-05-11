@@ -113,7 +113,7 @@ func TestTektonBuildPipelineRun(t *testing.T) {
 	if !ok || pipeline != "repo-ci" {
 		t.Fatalf("pipelineRef.name = %q", pipeline)
 	}
-	sa, ok := obj.NestedString("spec", "serviceAccountName")
+	sa, ok := obj.NestedString("spec", "taskRunTemplate", "serviceAccountName")
 	if !ok || sa != "runner" {
 		t.Fatalf("serviceAccountName = %q", sa)
 	}
