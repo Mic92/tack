@@ -264,8 +264,8 @@ func (s *store) AuthorizePipelineActor(
 	var n int
 	if err := s.db.QueryRowContext(ctx,
 		`SELECT COUNT(*) FROM repos
-          WHERE did = ? AND name = ? AND knot = ? AND spindle = ?`,
-		repoOwnerDID, repoName, knot, hostname,
+          WHERE did = ? AND (name = ? OR rkey = ?) AND knot = ? AND spindle = ?`,
+		repoOwnerDID, repoName, repoName, knot, hostname,
 	).Scan(&n); err != nil {
 		return false, "", fmt.Errorf("count repo claim: %w", err)
 	}

@@ -521,6 +521,20 @@ func TestAuthorizePipelineActor(t *testing.T) {
 			t.Fatalf("got ok=%v err=%v; want ok=true", ok, err)
 		}
 	})
+
+	t.Run("repo record key matches trigger repo when name is empty", func(t *testing.T) {
+		s := newTestStore(t)
+		const rkeyName = "woodyfm-site"
+		if err := s.UpsertRepo(ctx, owner, rkeyName,
+			knot, "", hostname, "", "t"); err != nil {
+			t.Fatal(err)
+		}
+		ok, _, err := s.AuthorizePipelineActor(ctx,
+			hostname, knot, owner, owner, rkeyName)
+		if err != nil || !ok {
+			t.Fatalf("got ok=%v err=%v; want ok=true", ok, err)
+		}
+	})
 }
 
 // countRows is a small SELECT COUNT(*) helper used by lifecycle tests
