@@ -1,7 +1,5 @@
-// Tack is a custom Tangled spindle that translates sh.tangled.pipeline
-// trigger records into Buildkite builds, and publishes Buildkite job state
-// back as sh.tangled.pipeline.status events on a WebSocket stream that the
-// Tangled appview can consume.
+// Tack is a custom Tangled spindle that turns knot ref updates into builds on
+// external CI providers and exposes their state through Tangled's CI XRPC API.
 package main
 
 import (
@@ -28,6 +26,7 @@ type config struct {
 	OwnerDID     string
 	JetstreamURL string
 	DBPath       string
+	RepoDir      string
 	// Dev flips the knot event-stream scheme from wss:// to ws://.
 	// Useful when running against a local knot during development.
 	Dev bool
@@ -63,12 +62,14 @@ type config struct {
 }
 
 func loadConfig() (config, error) {
+	dbPath := envOr("TACK_DB_PATH", "tack.db")
 	cfg := config{
 		Addr:                   envOr("TACK_LISTEN_ADDR", ":8080"),
 		Hostname:               os.Getenv("TACK_HOSTNAME"),
 		OwnerDID:               os.Getenv("TACK_OWNER_DID"),
 		JetstreamURL:           envOr("TACK_JETSTREAM_URL", "wss://jetstream1.us-west.bsky.network/subscribe"),
-		DBPath:                 envOr("TACK_DB_PATH", "tack.db"),
+		DBPath:                 dbPath,
+		RepoDir:                envOr("TACK_REPO_DIR", dbPath+".repos"),
 		Dev:                    os.Getenv("TACK_DEV") != "",
 		BuildkiteToken:         os.Getenv("TACK_BUILDKITE_TOKEN"),
 		BuildkiteOrg:           os.Getenv("TACK_BUILDKITE_ORG"),
@@ -174,10 +175,8 @@ func main() {
 	}()
 	logger.Info("store open", "path", cfg.DBPath)
 
-	// In-process broker for the /events fan-out. Wraps the store so
-	// publishes are durable and reconnecting subscribers can resume by
-	// cursor. Constructed before the consumers in case we ever want
-	// them to publish synthetic status events at startup.
+	// The broker durably records spindle-owned pipeline and status data for
+	// the current CI query API.
 	br := newBroker(st)
 
 	// Providers turn Tangled pipeline triggers into pipeline.status
@@ -245,7 +244,7 @@ func main() {
 	// loop has somewhere to register newly-observed knots into. It
 	// gets the provider so each incoming pipeline trigger has
 	// something to dispatch to.
-	knots, err := startKnotConsumer(ctx, cfg, st, provider)
+	knots, err := startKnotConsumer(ctx, cfg, st, br, provider)
 	if err != nil {
 		logger.Error("failed to start knot consumer", "err", err)
 		os.Exit(1)
@@ -262,7 +261,7 @@ func main() {
 
 	// Run the HTTP server. This blocks until ctx is cancelled or the
 	// listener errors.
-	if err := runHTTP(ctx, cfg, br, provider, bkProvider); err != nil {
+	if err := runHTTP(ctx, cfg, st, provider, bkProvider, knots.pipelines); err != nil {
 		logger.Error("http server error", "err", err)
 		os.Exit(1)
 	}

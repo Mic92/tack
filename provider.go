@@ -46,9 +46,8 @@ const (
 // ErrLogsNotFound is returned by Provider.Logs when the requested
 // (knot, pipelineRkey, workflow) tuple has no recorded logs — either
 // because that workflow never ran on this spindle, or because the
-// provider has since dropped it. The HTTP /logs handler translates
-// this into a 404 *before* upgrading to WebSocket so the appview's
-// dialer sees a real HTTP error rather than an immediate close.
+// provider has since dropped it. The CI log subscription retries this while
+// a workflow is active to cover asynchronous provider startup.
 var ErrLogsNotFound = errors.New("logs not found")
 
 // Provider dispatches a Tangled pipeline trigger to whatever backend
@@ -100,11 +99,8 @@ type Provider interface {
 	// identified by the same (knot, pipelineRkey, workflow) tuple
 	// Spawn was invoked with.
 	//
-	// Each LogLine corresponds 1:1 to one frame written by the HTTP
-	// /logs WebSocket handler — the handler marshals the LogLine and
-	// emits it as a single TextMessage so appview clients see the
-	// exact same wire shape they would from the stock Tangled spindle
-	// (whose on-disk log file holds the same records, one per line).
+	// Each LogLine is translated to one sh.tangled.ci.subscribePipelineLogs
+	// control or data event by the XRPC subscription handler.
 	//
 	// The returned channel is closed by the provider when the stream
 	// is complete; a closed channel is the only "end of stream"
@@ -120,9 +116,8 @@ type Provider interface {
 	// handles for a websocket that closes mid-stream.
 	//
 	// Returns ErrLogsNotFound if no logs exist for the requested
-	// tuple. Any other returned error indicates a backend failure
-	// and should surface as a 5xx to the HTTP caller. On a non-nil
-	// error, the channel is nil and there is nothing to drain.
+	// tuple. Any other returned error indicates a backend failure. On a
+	// non-nil error, the channel is nil and there is nothing to drain.
 	Logs(
 		ctx context.Context,
 		knot string,

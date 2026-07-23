@@ -364,7 +364,7 @@ func TestTektonLogsLookup(t *testing.T) {
 	// return ErrLogsNotFound: the workflow has been spawned and is
 	// just queueing inside Tekton. Surfacing 404 here mistranslates
 	// "still scheduling" as "doesn't exist" at the HTTP layer (see
-	// http.go's /logs handler). Verify we get an open channel that
+	// the CI log subscription handler). Verify we get an open channel that
 	// stays open until ctx is cancelled.
 	{
 		waitCtx, cancel := context.WithCancel(ctx)

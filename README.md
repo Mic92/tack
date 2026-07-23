@@ -41,17 +41,21 @@ providers.
 
 Tack is a drop-in alternative to the stock `spindle` runner. You run
 `tack` and [register it using the standard UI](https://tangled.org/settings/spindles).
+Native installations require `git` in `PATH`; the Docker and Nix packages
+include it automatically.
 
-Instead of executing workflows in local containers, tack translates each
-Tangled pipeline trigger into a 3rd party CI build, and reports build state
-back to Tangled using the existing `sh.tangled.pipeline.status` wire format.
+Instead of executing workflows in local containers, tack consumes knot
+`sh.tangled.git.refUpdate` events, loads `.tangled/workflows` at the pushed
+commit, and translates matching workflows into 3rd party CI builds. Tack owns
+the resulting pipeline records and exposes them through the standard
+`sh.tangled.ci.*` XRPC API.
 
 This makes even 3rd party CIs integrate first class into Tangled so their
 status, counts, etc. can show up inline in things like pull requests.
 
 ```
    Jetstream                Knot /events (WebSocket)
-   sh.tangled.repo          sh.tangled.pipeline triggers
+   sh.tangled.repo          sh.tangled.git.refUpdate
    sh.tangled.spindle.member
    sh.tangled.repo.collaborator
         │                            │
@@ -72,8 +76,8 @@ status, counts, etc. can show up inline in things like pull requests.
                        │
                        │  POST /webhooks/buildkite
                        ▼
-                      tack  ──── /events (WebSocket) ────▶  Tangled appview
-                                 sh.tangled.pipeline.status
+                      tack  ◀──── sh.tangled.ci.* XRPC ────  Tangled appview
+                                 query/get pipeline + CBOR logs
 ```
 
 ## Configuration
@@ -94,6 +98,7 @@ configuration (e.g. Buildkite) lives in its own section below.
 | -------------------- | -------------------------------------------------------- |
 | `TACK_LISTEN_ADDR`   | HTTP listen address (default `:8080`)                    |
 | `TACK_DB_PATH`       | Local SQLite path (default `tack.db`)                    |
+| `TACK_REPO_DIR`      | Sparse workflow checkout cache (default `tack.db.repos`) |
 | `TACK_JETSTREAM_URL` | Tangled Jetstream WebSocket URL                          |
 | `TACK_DEV`           | Use `ws://` for knot event-streams (any non-empty value) |
 

@@ -43,6 +43,8 @@ func commitEvent(timeUS int64, did, collection, op, rkey string, record any) *js
 	}
 }
 
+func testString(value string) *string { return &value }
+
 // requireCursor asserts the persisted cursor equals want. Pulled out
 // because almost every test in this file checks it.
 func requireCursor(t *testing.T, s *store, want int64) {
@@ -70,7 +72,7 @@ func handleJetstreamEvent(
 		Collections: jetstreamCollections,
 		CursorStore: st,
 		Handler: js.HandlerFunc(func(ctx context.Context, evt *jsmodels.Event) error {
-			return applyCommit(ctx, st, knots, hostname, ownerDID, evt)
+			return applyCommit(ctx, st, knots, nil, hostname, ownerDID, evt)
 		}),
 		Logger: loggerFrom(ctx),
 	}
@@ -161,7 +163,7 @@ func TestHandleRepoCreateOptionals(t *testing.T) {
 	repoDid := "did:plc:repo"
 	rec := tangled.Repo{
 		Knot:      "knot.example",
-		Name:      "myrepo",
+		Name:      testString("myrepo"),
 		Spindle:   &spindle,
 		RepoDid:   &repoDid,
 		CreatedAt: "2026-01-01T00:00:00Z",
@@ -187,7 +189,7 @@ func TestHandleRepoCreateOptionals(t *testing.T) {
 	// strings, not crash on a nil dereference in deref().
 	rec2 := tangled.Repo{
 		Knot:      "knot.example",
-		Name:      "other",
+		Name:      testString("other"),
 		CreatedAt: "2026-01-01T00:00:00Z",
 	}
 	evt2 := commitEvent(8, "did:plc:owner", tangled.RepoNSID, jsOpCreate, "repo2", rec2)
@@ -212,10 +214,14 @@ func TestHandleRepoCreateOptionals(t *testing.T) {
 func TestHandleRepoCollaboratorCreate(t *testing.T) {
 	s := newTestStore(t)
 	ctx := context.Background()
+	if err := s.UpsertRepo(
+		ctx, "did:plc:owner", "repo", "knot.example", "repo", "", "did:plc:repo", "t",
+	); err != nil {
+		t.Fatal(err)
+	}
 
-	repo := "myrepo"
 	rec := tangled.RepoCollaborator{
-		Repo:      &repo,
+		Repo:      "did:plc:repo",
 		Subject:   "did:plc:carol",
 		CreatedAt: "2026-01-01T00:00:00Z",
 	}
@@ -236,6 +242,34 @@ func TestHandleRepoCollaboratorCreate(t *testing.T) {
 		t.Fatalf("subject = %q", subject)
 	}
 	requireCursor(t, s, 55)
+}
+
+func TestHandleRepoCollaboratorRejectsNonOwner(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	if err := s.UpsertRepo(
+		ctx, "did:plc:owner", "repo", "knot.example", "repo", "", "did:plc:repo", "t",
+	); err != nil {
+		t.Fatal(err)
+	}
+	record := tangled.RepoCollaborator{
+		Repo: "did:plc:repo", Subject: "did:plc:attacker", CreatedAt: "2026-01-01T00:00:00Z",
+	}
+	event := commitEvent(
+		56, "did:plc:attacker", tangled.RepoCollaboratorNSID, jsOpCreate, "forged", record,
+	)
+	if err := handleJetstreamEvent(ctx, s, nil, "", "", event); err != nil {
+		t.Fatal(err)
+	}
+	authorized, err := s.IsRepoActorAuthorized(
+		ctx, "did:plc:repo", "did:plc:owner", "did:plc:attacker",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if authorized {
+		t.Fatal("forged collaborator was authorized")
+	}
 }
 
 // TestHandleUnknownCollection makes sure a collection we didn't ask for
@@ -349,7 +383,7 @@ func TestRepoEventSubscribesKnotForOurSpindle(t *testing.T) {
 	spindle := ours
 	rec := tangled.Repo{
 		Knot:      "knot.example",
-		Name:      "myrepo",
+		Name:      testString("myrepo"),
 		Spindle:   &spindle,
 		CreatedAt: "2026-01-01T00:00:00Z",
 	}
@@ -382,7 +416,7 @@ func TestRepoEventIgnoresUnauthorizedPublisher(t *testing.T) {
 	spindle := ours
 	rec := tangled.Repo{
 		Knot:      "evil.example",
-		Name:      "myrepo",
+		Name:      testString("myrepo"),
 		Spindle:   &spindle,
 		CreatedAt: "2026-01-01T00:00:00Z",
 	}
@@ -417,7 +451,7 @@ func TestSpindleMemberGrantSubscribesPendingKnots(t *testing.T) {
 	spindle := ours
 	repoRec := tangled.Repo{
 		Knot:      "knot.example",
-		Name:      "myrepo",
+		Name:      testString("myrepo"),
 		Spindle:   &spindle,
 		CreatedAt: "2026-01-01T00:00:00Z",
 	}
@@ -445,6 +479,30 @@ func TestSpindleMemberGrantSubscribesPendingKnots(t *testing.T) {
 	}
 	if added := fake.Added(); len(added) != 1 || added[0] != "knot.example" {
 		t.Fatalf("AddKnot after grant = %v, want [knot.example]", added)
+	}
+}
+
+func TestSpindleMemberGrantForOtherInstanceIgnored(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	const ours = "tack.example"
+	const owner = "did:plc:owner"
+	const alice = "did:plc:alice"
+	if err := s.UpsertRepo(
+		ctx, alice, "rk", "knot.example", "repo", ours, "did:plc:repo", "t",
+	); err != nil {
+		t.Fatal(err)
+	}
+	grant := tangled.SpindleMember{
+		Instance: "other.example", Subject: alice, CreatedAt: "2026-01-02T00:00:00Z",
+	}
+	event := commitEvent(2, owner, tangled.SpindleMemberNSID, jsOpCreate, "mk", grant)
+	fake := &fakeKnotConsumer{}
+	if err := handleJetstreamEvent(ctx, s, fake, ours, owner, event); err != nil {
+		t.Fatal(err)
+	}
+	if added := fake.Added(); len(added) != 0 {
+		t.Fatalf("AddKnot calls = %v, want none", added)
 	}
 }
 
@@ -528,7 +586,7 @@ func TestRepoEventIgnoresKnotForOtherSpindle(t *testing.T) {
 	other := "other-spindle.example"
 	rec := tangled.Repo{
 		Knot:      "knot.example",
-		Name:      "myrepo",
+		Name:      testString("myrepo"),
 		Spindle:   &other,
 		CreatedAt: "2026-01-01T00:00:00Z",
 	}
@@ -563,7 +621,7 @@ func TestRepoUpdateSpindleAwayFromUsRemovesKnot(t *testing.T) {
 	other := "other.example"
 	rec := tangled.Repo{
 		Knot:      knot,
-		Name:      "repo-a",
+		Name:      testString("repo-a"),
 		Spindle:   &other,
 		CreatedAt: "2026-01-01T00:00:00Z",
 	}
@@ -615,7 +673,7 @@ func TestRepoUpdateSpindleAwayFromUsKeepsKnotIfShared(t *testing.T) {
 	other := "other.example"
 	rec := tangled.Repo{
 		Knot:      knot,
-		Name:      "a",
+		Name:      testString("a"),
 		Spindle:   &other,
 		CreatedAt: "2026-01-01T00:00:00Z",
 	}
@@ -655,7 +713,7 @@ func TestRepoUpdateChangingKnotSwapsSubscription(t *testing.T) {
 	spindle := ours
 	rec := tangled.Repo{
 		Knot:      newKnot,
-		Name:      "a",
+		Name:      testString("a"),
 		Spindle:   &spindle,
 		CreatedAt: "2026-01-01T00:00:00Z",
 	}

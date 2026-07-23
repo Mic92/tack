@@ -225,7 +225,7 @@ func TestBuildkiteSpawnWorkflowConfig(t *testing.T) {
 	}
 
 	// The workflow's `org` override has to round-trip through
-	// the store: /logs (and any future post-creation API call)
+	// the store: log subscriptions and future post-creation API calls
 	// looks the row up by tuple and re-issues calls against the
 	// org we recorded here. If we drop it, log retrieval falls
 	// back to defaultOrg and 404s for cross-org workflows.
@@ -676,10 +676,10 @@ func TestBuildkiteWebhookHandlerNoProvider(t *testing.T) {
 // real CI provider would feed into its build-creation API.
 func TestTriggerCommitAndBranch(t *testing.T) {
 	cases := []struct {
-		name              string
-		in                *tangled.Pipeline_TriggerMetadata
-		wantCommit        string
-		wantBranch        string
+		name       string
+		in         *tangled.Pipeline_TriggerMetadata
+		wantCommit string
+		wantBranch string
 	}{
 		{"nil", nil, "", ""},
 		{"push refs/heads",
@@ -704,10 +704,18 @@ func TestTriggerCommitAndBranch(t *testing.T) {
 		},
 		{"manual with default branch",
 			&tangled.Pipeline_TriggerMetadata{
-				Manual: &tangled.Pipeline_ManualTriggerData{},
+				Manual: &tangled.Pipeline_ManualTriggerData{Sha: "fed"},
 				Repo:   &tangled.Pipeline_TriggerRepo{DefaultBranch: "main"},
 			},
-			"", "main",
+			"fed", "main",
+		},
+		{"manual with explicit ref",
+			&tangled.Pipeline_TriggerMetadata{
+				Manual: &tangled.Pipeline_ManualTriggerData{
+					Sha: "fed", Ref: testString("refs/heads/release"),
+				},
+			},
+			"fed", "release",
 		},
 	}
 	for _, c := range cases {

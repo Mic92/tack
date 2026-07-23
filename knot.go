@@ -3,11 +3,9 @@ package main
 // Knot event-stream subscriber.
 //
 // Tangled knot servers expose a websocket at ws[s]://<knot>/events that
-// streams JSON-wrapped record events for that knot, including the
-// sh.tangled.pipeline trigger records that drive CI. Pipeline triggers do
-// *not* come over the AT Proto firehose (jetstream); the knot publishes
-// them itself, so as a spindle we have to dial each knot whose repos have
-// pointed at us.
+// streams JSON-wrapped record events for that knot. Since Tangled 1.14,
+// sh.tangled.git.refUpdate is the CI input: the spindle discovers workflows
+// and creates the sh.tangled.pipeline record itself.
 //
 // We use tangled-core's `eventconsumer` package, which already handles
 // per-source connection management, retries, ordered processing and
@@ -15,9 +13,7 @@ package main
 //
 //   1. The initial set of knots, derived from previously-observed
 //      sh.tangled.repo records that named us as their .spindle field.
-//   2. A ProcessFunc that, for now, simply logs every received event.
-//      Once the build pipeline is wired up this is where pipeline
-//      triggers will be translated into Buildkite builds.
+//   2. A ProcessFunc that turns authorized ref updates into provider builds.
 //
 // The jetstream consumer also gets a back-reference (via the
 // KnotConsumer interface) so it can dynamically subscribe a new knot —
@@ -34,6 +30,8 @@ import (
 	"tangled.org/core/api/tangled"
 	"tangled.org/core/eventconsumer"
 	"tangled.org/core/eventconsumer/cursor"
+	"tangled.org/core/eventstream"
+	knotdb "tangled.org/core/knotserver/db"
 )
 
 // KnotConsumer is the surface area the rest of tack uses to interact
@@ -77,23 +75,10 @@ type knotConsumer struct {
 	// knot — see seedCursorIfMissing for why.
 	cursors cursor.Store
 
-	// provider dispatches each incoming pipeline trigger to whatever
-	// backend actually runs it (today: the fake provider; tomorrow:
-	// Buildkite). The consumer doesn't care which — it just hands
-	// over the decoded record and lets the provider publish status
-	// records back through its own broker connection.
-	provider Provider
-
-	// store, hostname, and ownerDID are the inputs to the
-	// pre-dispatch authorization check. We hold them on the
-	// consumer (instead of threading them through every call) so
-	// process(), which runs once per inbound knot event on a
-	// worker goroutine, can ask `is this trigger allowed?` against
-	// the persisted Tangled membership state without the rest of
-	// tack having to know it cares.
-	store    *store
-	hostname string
-	ownerDID string
+	// pipelines owns the post-1.13 protocol: it turns low-level knot ref
+	// updates into retained spindle-local pipeline records and provider work.
+	pipelines *pipelineService
+	dev       bool
 }
 
 // Compile-time interface conformance check.
@@ -112,7 +97,13 @@ var _ KnotConsumer = (*knotConsumer)(nil)
 // mattn/go-sqlite3 in WAL mode tolerates concurrent connections, and
 // the `cursors` table the upstream package creates doesn't collide
 // with any of our migrations.
-func startKnotConsumer(ctx context.Context, cfg config, st *store, provider Provider) (*knotConsumer, error) {
+func startKnotConsumer(
+	ctx context.Context,
+	cfg config,
+	st *store,
+	br *broker,
+	provider Provider,
+) (*knotConsumer, error) {
 	logger := loggerFrom(ctx).With("component", "knotconsumer")
 
 	knots, err := st.KnotsForSpindle(ctx, cfg.Hostname, cfg.OwnerDID)
@@ -121,7 +112,7 @@ func startKnotConsumer(ctx context.Context, cfg config, st *store, provider Prov
 	}
 
 	// Persistent per-source cursor store. Keyed by source.Key() (the
-	// knot hostname for KnotSource), so each knot resumes exactly
+	// kind-prefixed knot hostname for KnotSource), so each knot resumes exactly
 	// where it left off and we don't re-fire builds for events that
 	// were already processed before the previous shutdown.
 	cursorStore, err := cursor.NewSQLiteStore(cfg.DBPath)
@@ -130,17 +121,14 @@ func startKnotConsumer(ctx context.Context, cfg config, st *store, provider Prov
 	}
 
 	kc := &knotConsumer{
-		log:      logger,
-		cursors:  cursorStore,
-		provider: provider,
-		store:    st,
-		hostname: cfg.Hostname,
-		ownerDID: cfg.OwnerDID,
+		log:       logger,
+		cursors:   cursorStore,
+		pipelines: newPipelineService(ctx, cfg, st, br, provider),
+		dev:       cfg.Dev,
 	}
 
 	ccfg := eventconsumer.NewConsumerConfig()
 	ccfg.Logger = logger
-	ccfg.Dev = cfg.Dev
 	ccfg.ProcessFunc = kc.process
 	ccfg.CursorStore = cursorStore
 	for _, k := range knots {
@@ -148,8 +136,10 @@ func startKnotConsumer(ctx context.Context, cfg config, st *store, provider Prov
 		// ever connects, so a fresh tack install doesn't replay every
 		// historical pipeline event the knot has retained and fire a
 		// duplicate Buildkite build for each one.
-		kc.seedCursorIfMissing(k)
-		ccfg.Sources[eventconsumer.NewKnotSource(k)] = struct{}{}
+		source := kc.source(k)
+		eventconsumer.MigrateLegacyCursor(cursorStore, source)
+		kc.seedCursorIfMissing(source)
+		ccfg.Sources[source] = struct{}{}
 		logger.Info("seeding knot source", "knot", k)
 	}
 	kc.c = eventconsumer.NewConsumer(*ccfg)
@@ -174,9 +164,11 @@ func (k *knotConsumer) AddKnot(ctx context.Context, knot string) {
 	// have never observed before must not retroactively fire
 	// pipelines for triggers older than the moment we learned about
 	// it. AddSource reads the cursor synchronously when it dials.
-	k.seedCursorIfMissing(knot)
+	source := k.source(knot)
+	eventconsumer.MigrateLegacyCursor(k.cursors, source)
+	k.seedCursorIfMissing(source)
 	k.log.Info("adding knot source", "knot", knot)
-	k.c.AddSource(ctx, eventconsumer.NewKnotSource(knot))
+	k.c.AddSource(ctx, source)
 }
 
 // seedCursorIfMissing writes the current time (as nanoseconds since
@@ -195,16 +187,24 @@ func (k *knotConsumer) AddKnot(ctx context.Context, knot string) {
 // Get returning 0 means "no cursor stored" across all the cursor
 // store implementations we use (memory/sqlite/redis), so it's a
 // safe sentinel to gate the write.
-func (k *knotConsumer) seedCursorIfMissing(knot string) {
-	if k.cursors.Get(knot) != 0 {
+func (k *knotConsumer) seedCursorIfMissing(source eventconsumer.Source) {
+	if k.cursors.Get(source.Key()) != 0 {
 		return
 	}
 	now := time.Now().UnixNano()
-	k.cursors.Set(knot, now)
+	k.cursors.Set(source.Key(), now)
 	k.log.Info("seeded fresh knot cursor to now",
-		"knot", knot,
+		"knot", source.Host,
 		"cursor", now,
 	)
+}
+
+func (k *knotConsumer) source(knot string) eventconsumer.Source {
+	source := eventconsumer.NewKnotSource(knot)
+	if k.dev {
+		source.NoTLS = true
+	}
+	return source
 }
 
 // RemoveKnot unsubscribes from a knot that no longer has any authorized
@@ -215,7 +215,7 @@ func (k *knotConsumer) RemoveKnot(_ context.Context, knot string) {
 		return
 	}
 	k.log.Info("removing knot source", "knot", knot)
-	k.c.RemoveSource(eventconsumer.NewKnotSource(knot))
+	k.c.RemoveSource(k.source(knot))
 }
 
 // Stop tears down all knot websocket connections and waits for the
@@ -226,102 +226,48 @@ func (k *knotConsumer) Stop() {
 
 // process is the ProcessFunc handed to eventconsumer. It runs once per
 // inbound message, on a worker goroutine. For now we only care about
-// pipeline records — everything else is logged at debug and dropped.
+// git ref updates; everything else is logged at debug and dropped.
 //
 // Returning an error only logs it (the consumer keeps reading); the
-// cursor is advanced before the ProcessFunc runs, so a returned error
-// does *not* cause a replay.
-func (k *knotConsumer) process(ctx context.Context, src eventconsumer.Source, msg eventconsumer.Message) error {
+// cursor is advanced after the ProcessFunc runs even if it returns an error,
+// so a returned error does not cause a replay.
+func (k *knotConsumer) process(
+	ctx context.Context,
+	src eventconsumer.Source,
+	msg eventstream.Event,
+) error {
 	switch msg.Nsid {
-	case tangled.PipelineNSID:
-		var p tangled.Pipeline
-		if err := json.Unmarshal(msg.EventJson, &p); err != nil {
-			k.log.Error("decode pipeline",
+	case tangled.GitRefUpdateNSID:
+		var event tangled.GitRefUpdate
+		if err := json.Unmarshal(msg.EventJson, &event); err != nil {
+			k.log.Error("decode git ref update",
 				"err", err,
-				"knot", src.Key(),
+				"knot", src.Host,
 				"rkey", msg.Rkey,
 			)
 			return err
 		}
-
-		// Pull a couple of fields out of the trigger metadata for log
-		// context. They're all optional in the schema, so each one is
-		// guarded — we want a noisy log entry, not a nil-deref.
-		var (
-			triggerKind string
-			repoDid     string
-			repoName    string
-		)
-		if p.TriggerMetadata != nil {
-			triggerKind = p.TriggerMetadata.Kind
-			if p.TriggerMetadata.Repo != nil {
-				repoDid = p.TriggerMetadata.Repo.Did
-				if p.TriggerMetadata.Repo.Repo != nil {
-					repoName = *p.TriggerMetadata.Repo.Repo
-				}
-			}
+		if err := k.pipelines.processRefUpdate(ctx, src, &event); err != nil {
+			k.log.Warn("git ref update failed; scheduling retry", "err", err, "repo", event.Repo)
+			k.retryPipelineEvent("git ref update", func(ctx context.Context) error {
+				return k.pipelines.processRefUpdate(ctx, src, &event)
+			})
 		}
-
-		k.log.Info("pipeline event",
-			"knot", src.Key(),
-			"rkey", msg.Rkey,
-			"trigger", triggerKind,
-			"repo_did", repoDid,
-			"repo", repoName,
-			"workflows", len(p.Workflows),
-		)
-
-		// Authorization gate. The knot's /events stream will hand
-		// us every pipeline record it publishes, including ones
-		// for repos that never opted into us. Being subscribed
-		// to a knot says nothing about which repos on it we
-		// actually serve. Without this check, any DID that can
-		// publish a sh.tangled.pipeline record on a knot we
-		// already watch could trigger CI on our spindle.
-		//
-		// We consult the persisted state mirrored from the AT
-		// Proto firehose: the trigger's repo must have declared
-		// us as its spindle on this knot, and its publisher DID
-		// must be the spindle owner or a member they vouched for
-		// via sh.tangled.spindle.member. See
-		// store.AuthorizePipelineActor for the precise rules.
-		ok, reason, err := k.store.AuthorizePipelineActor(
-			ctx, k.hostname, src.Key(), k.ownerDID,
-			repoDid, repoName,
-		)
-		if err != nil {
-			// SQL/IO failure (not a denial). Log and refuse to
-			// spawn rather than fail-open: a transient store
-			// error during shutdown shouldn't be allowed to
-			// punch a hole in the security gate.
-			k.log.Error("authorize pipeline trigger",
-				"err", err,
-				"knot", src.Key(),
-				"rkey", msg.Rkey,
-				"repo_did", repoDid,
-				"repo", repoName,
+		return nil
+	case knotdb.RepoCollaboratorUpdateNSID:
+		var event knotdb.RepoCollaboratorUpdate
+		if err := json.Unmarshal(msg.EventJson, &event); err != nil {
+			return fmt.Errorf("decode knot collaborator update: %w", err)
+		}
+		if err := k.pipelines.processKnotCollaborator(ctx, src, &event); err != nil {
+			k.log.Warn("collaborator update failed; scheduling retry",
+				"err", err, "repo", event.Repo,
 			)
-			return err
+			k.retryPipelineEvent("collaborator update", func(ctx context.Context) error {
+				return k.pipelines.processKnotCollaborator(ctx, src, &event)
+			})
 		}
-		if !ok {
-			k.log.Warn("rejecting unauthorized pipeline trigger",
-				"knot", src.Key(),
-				"rkey", msg.Rkey,
-				"repo_did", repoDid,
-				"repo", repoName,
-				"reason", reason,
-			)
-			return nil
-		}
-
-		// Hand the trigger to whichever Provider was configured.
-		// Spawn is non-blocking — it fans out into provider-owned
-		// goroutines so this worker can move on to the next event.
-		// The provider keeps ctx around for shutdown coordination.
-		// repoDid is the actor: the publisher of the originating
-		// sh.tangled.repo record, which AuthorizePipelineActor
-		// just confirmed is allowed to spawn work here.
-		k.provider.Spawn(ctx, src.Key(), msg.Rkey, repoDid, p.TriggerMetadata, p.Workflows)
+		return nil
 
 	default:
 		// Knots may publish other record types over the same stream; we
@@ -329,11 +275,40 @@ func (k *knotConsumer) process(ctx context.Context, src eventconsumer.Source, ms
 		// chasing "why isn't my pipeline firing" but doesn't drown out
 		// info-level logs.
 		k.log.Debug("ignored knot event",
-			"knot", src.Key(),
+			"knot", src.Host,
 			"nsid", msg.Nsid,
 			"rkey", msg.Rkey,
 		)
 	}
 
 	return nil
+}
+
+func (k *knotConsumer) retryPipelineEvent(
+	kind string,
+	process func(context.Context) error,
+) {
+	go func() {
+		delay := 15 * time.Second
+		for attempt := 1; attempt <= 5; attempt++ {
+			timer := time.NewTimer(delay)
+			select {
+			case <-k.pipelines.rootCtx.Done():
+				timer.Stop()
+				return
+			case <-timer.C:
+			}
+			if err := process(k.pipelines.rootCtx); err == nil {
+				k.log.Info("retried knot event successfully", "kind", kind, "attempt", attempt)
+				return
+			} else {
+				k.log.Warn("knot event retry failed",
+					"kind", kind, "attempt", attempt, "err", err,
+				)
+			}
+			if delay < 2*time.Minute {
+				delay *= 2
+			}
+		}
+	}()
 }

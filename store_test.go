@@ -316,7 +316,7 @@ func TestKnotsForSpindle(t *testing.T) {
 // later renders as "...:00.000000001Z". Lex ordering puts ".000000001Z"
 // *before* "Z" because '.' (0x2E) < 'Z' (0x5A), so ORDER BY created_at
 // DESC would surface the *earlier* row as the latest build. Sorting
-// on created_unix_ns avoids that and is what /logs depends on to
+// on created_unix_ns avoids that and is what log subscriptions depend on to
 // resolve the right run.
 func TestLookupBuildkiteBuildByTuplePicksMostRecent(t *testing.T) {
 	s := newTestStore(t)

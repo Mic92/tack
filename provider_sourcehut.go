@@ -247,7 +247,7 @@ func (p *sourcehutProvider) spawnWorkflow(
 		PipelineURI:  pipelineURI,
 	}
 	if err := p.st.InsertSourcehutJob(ctx, ref); err != nil {
-		// Without the row the watch goroutine and any /logs lookup
+		// Without the row the watch goroutine and any log lookup
 		// can't recover the job. Surface loudly and bail.
 		logger.Error("persist sourcehut job mapping", "err", err,
 			"job_id", job.ID,
@@ -357,7 +357,7 @@ func mapSourcehutStatus(state string) (status string, terminal bool, ok bool) {
 //
 // Snapshot read, not a tail — for an in-progress job each task's log
 // is fetched at its current length and the channel closes. The
-// appview's repeated /logs calls during a running build give us
+// repeated log subscription snapshots during a running build give us
 // "good enough" liveness.
 func (p *sourcehutProvider) Logs(
 	ctx context.Context,

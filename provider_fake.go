@@ -6,11 +6,10 @@ package main
 // sh.tangled.pipeline.status records — "running" every five seconds
 // for thirty seconds, then a final "success" — through the broker.
 // In parallel it appends synthetic LogLine records into an in-memory
-// buffer, so /logs queries against a fake run replay something that
-// matches the upstream spindle's wire format.
+// buffer, so log subscriptions against a fake run replay plausible output.
 //
-// The point is to exercise the entire trigger → broker → /events →
-// appview path end-to-end before any real CI integration exists. Once
+// The point is to exercise the trigger → persistence → XRPC path end-to-end
+// before any real CI integration exists. Once
 // the Buildkite provider lands, this one stays around as a reference
 // implementation and as the test double of choice when a test wants
 // "something that publishes plausible status updates" without the
@@ -153,8 +152,8 @@ func (p *fakeProvider) Logs(
 
 // runWorkflow emits a "running" status every fakeJobInterval until
 // fakeJobDuration elapses, then a final "success". Alongside each
-// status it appends a corresponding LogLine into the in-memory log
-// buffer so /logs returns something coherent.
+// status it appends a corresponding LogLine into the in-memory log buffer so
+// subscriptions return something coherent.
 //
 // On ctx cancellation it returns without issuing the terminal publish
 // or the closing control frame — the broker's underlying store may

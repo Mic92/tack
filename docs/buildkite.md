@@ -30,7 +30,7 @@ logs. Generate one at
 | ------------------- | ------------------------------------------------- |
 | `read_organizations`| Sanity-checking the configured org slug           |
 | `write_builds`      | `POST .../builds` when a Tangled trigger arrives  |
-| `read_builds`       | Resolving build → jobs for the `/logs` endpoint   |
+| `read_builds`       | Resolving builds and jobs for log subscriptions  |
 | `read_build_logs`   | Streaming job logs back to the Tangled appview    |
 
 Restrict the token to the specific organization(s) tack will spawn

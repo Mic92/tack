@@ -377,7 +377,7 @@ func (p *buildkiteProvider) buildCreateRequest(
 // This is a snapshot read, not a tail — finished or in-progress, we
 // fetch what's there and close. Live tailing would require Buildkite
 // agent log streaming, which the public REST API doesn't expose; the
-// appview's repeated /logs calls during a running build give us
+// repeated log subscription snapshots during a running build give us
 // "good enough" liveness without that complexity.
 func (p *buildkiteProvider) Logs(
 	ctx context.Context,
@@ -730,11 +730,17 @@ func triggerCommitAndBranch(trigger *tangled.Pipeline_TriggerMetadata) (string, 
 	case trigger.PullRequest != nil:
 		// PRs build the source commit on the source branch.
 		return trigger.PullRequest.SourceSha, trigger.PullRequest.SourceBranch
+	case trigger.Manual != nil:
+		branch := ""
+		if trigger.Manual.Ref != nil {
+			branch = refToBranch(*trigger.Manual.Ref)
+		} else if trigger.Repo != nil {
+			branch = trigger.Repo.DefaultBranch
+		}
+		return trigger.Manual.Sha, branch
 	default:
-		// Manual triggers and any future kinds: fall back to the
-		// repo default branch with no commit, which the caller
-		// will treat as fatal — manual triggers will need
-		// additional plumbing to pick a commit.
+		// Future trigger kinds can still use the repository's default
+		// branch, but have no commit until their metadata is supported.
 		if trigger.Repo != nil {
 			return "", trigger.Repo.DefaultBranch
 		}

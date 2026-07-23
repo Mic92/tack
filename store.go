@@ -8,9 +8,8 @@ package main
 //     and the authorization helpers built on top of it, used both to
 //     gate inbound pipeline triggers and to decide which knots we
 //     should be subscribed to
-//   - the outbound event log fed to /events websocket subscribers
-//   - the Buildkite build → pipeline mapping the webhook and /logs
-//     handlers look up
+//   - spindle-owned pipeline and status records served by the CI XRPC API
+//   - provider run mappings used by webhooks and log subscriptions
 //
 // Per-method docs go into more detail.
 
@@ -21,6 +20,7 @@ import (
 	"errors"
 	"fmt"
 	"strconv"
+	"sync"
 	"time"
 
 	_ "github.com/mattn/go-sqlite3"
@@ -31,6 +31,11 @@ import (
 // layer be swapped or mocked later without rewriting callers.
 type store struct {
 	db *sql.DB
+
+	// eventMu makes event cursors strictly monotonic even when two provider
+	// callbacks publish within the same clock tick.
+	eventMu        sync.Mutex
+	lastEventNanos int64
 }
 
 // openStore opens (or creates) the SQLite database at path and applies
@@ -58,6 +63,10 @@ func openStore(path string) (*store, error) {
 	if err := s.migrate(context.Background()); err != nil {
 		_ = db.Close()
 		return nil, err
+	}
+	if err := db.QueryRow(`SELECT COALESCE(MAX(created), 0) FROM events`).Scan(&s.lastEventNanos); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("load event clock: %w", err)
 	}
 	return s, nil
 }
@@ -215,6 +224,129 @@ func (s *store) GetRepo(ctx context.Context, did, rkey string) (knot, spindle st
 	return knot, spindle, nil
 }
 
+// RepoRef is the repository identity Tack needs when turning a knot event into
+// a spindle-owned pipeline. RepoDID is the stable git identity; OwnerDID and
+// Rkey identify the sh.tangled.repo record that assigned the spindle.
+type RepoRef struct {
+	OwnerDID string
+	Rkey     string
+	Knot     string
+	Name     string
+	Spindle  string
+	RepoDID  string
+}
+
+// RepoByDID resolves the latest repository record for a stable repository DID.
+func (s *store) RepoByDID(ctx context.Context, repoDID string) (*RepoRef, error) {
+	var repo RepoRef
+	err := s.db.QueryRowContext(ctx, `
+		SELECT did, rkey, knot, name, spindle, repo_did
+		FROM repos
+		WHERE repo_did = ?
+		ORDER BY created_at DESC
+		LIMIT 1`, repoDID,
+	).Scan(
+		&repo.OwnerDID, &repo.Rkey, &repo.Knot, &repo.Name,
+		&repo.Spindle, &repo.RepoDID,
+	)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("lookup repo by DID: %w", err)
+	}
+	return &repo, nil
+}
+
+// ManagedRepoByDID resolves a repository assignment only when it agrees with
+// the authoritative knot and owner resolved from the repository DID.
+func (s *store) ManagedRepoByDID(
+	ctx context.Context,
+	repoDID, hostname, ownerDID, knot, repoOwnerDID, repoRkey string,
+) (*RepoRef, error) {
+	var repo RepoRef
+	err := s.db.QueryRowContext(ctx, `
+		SELECT r.did, r.rkey, r.knot, r.name, r.spindle, r.repo_did
+		FROM repos r
+		WHERE r.repo_did = ?
+		  AND r.spindle = ?
+		  AND r.knot = ?
+		  AND (? = '' OR r.did = ?)
+		  AND (? = '' OR r.rkey = ?)
+		  AND (
+			r.did = ?
+			OR EXISTS (
+				SELECT 1 FROM spindle_members m
+				WHERE m.did = ? AND m.instance = ? AND m.subject = r.did
+			)
+		  )
+		ORDER BY r.created_at DESC
+		LIMIT 1`,
+		repoDID, hostname, knot, repoOwnerDID, repoOwnerDID,
+		repoRkey, repoRkey,
+		ownerDID, ownerDID, hostname,
+	).Scan(
+		&repo.OwnerDID, &repo.Rkey, &repo.Knot, &repo.Name,
+		&repo.Spindle, &repo.RepoDID,
+	)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("lookup managed repo by DID: %w", err)
+	}
+	return &repo, nil
+}
+
+func (s *store) HasManagedRepo(
+	ctx context.Context,
+	repoDID, hostname, ownerDID string,
+) (bool, error) {
+	var count int
+	err := s.db.QueryRowContext(ctx, `
+		SELECT COUNT(*)
+		FROM repos r
+		WHERE r.repo_did = ? AND r.spindle = ?
+		  AND (
+			r.did = ?
+			OR EXISTS (
+				SELECT 1 FROM spindle_members m
+				WHERE m.did = ? AND m.instance = ? AND m.subject = r.did
+			)
+		  )`, repoDID, hostname, ownerDID, ownerDID, hostname,
+	).Scan(&count)
+	if err != nil {
+		return false, fmt.Errorf("check managed repo: %w", err)
+	}
+	return count > 0, nil
+}
+
+// IsRepoActorAuthorized reports whether actor owns or collaborates on repoDID.
+// New Tangled appviews authenticate manual and retry requests as the user that
+// initiated them, so this check is the XRPC equivalent of the push permission
+// check performed by the stock spindle.
+func (s *store) IsRepoActorAuthorized(
+	ctx context.Context,
+	repoDID, ownerDID, actor string,
+) (bool, error) {
+	if actor == ownerDID {
+		return true, nil
+	}
+	var n int
+	err := s.db.QueryRowContext(ctx, `
+		SELECT COUNT(*)
+		FROM repo_collaborators c
+		WHERE c.did = ?
+		  AND c.subject = ?
+		  AND (c.repo_did = ? OR c.repo = ?)`,
+		ownerDID, actor, repoDID, repoDID,
+	).Scan(&n)
+	if err != nil {
+		return false, fmt.Errorf("authorize repo actor: %w", err)
+	}
+	return n > 0, nil
+}
+
 // AuthorizePipelineActor reports whether a pipeline trigger that
 // arrived on knot for repo (repoOwnerDID, repoName) should be allowed
 // to spawn work on this spindle. Both halves of the answer are
@@ -234,12 +366,10 @@ func (s *store) GetRepo(ctx context.Context, did, rkey string) (knot, spindle st
 //  2. **Actor membership**: repoOwnerDID is either the spindle owner
 //     itself, or has been authorized via a sh.tangled.spindle.member
 //     record published by the spindle owner. The publisher (`did`)
-//     of that membership grant must equal ownerDID. Anyone can
-//     publish a member record naming anyone, so trusting unsigned
-//     grants would let any DID grant itself access. We do NOT match
-//     against the record's `instance` column because the upstream
-//     ecosystem stores it inconsistently (URL vs hostname), and a
-//     tack instance only ever speaks for a single hostname anyway.
+//     of that membership grant must equal ownerDID, and its instance must
+//     equal this spindle hostname. Anyone can publish a member record naming
+//     anyone, so trusting unscoped grants would let any DID grant itself
+//     access or reuse a grant intended for another spindle.
 //
 // reason is a short, log-friendly description of why authorization
 // failed when ok is false; it is empty when ok is true. Errors
@@ -279,8 +409,8 @@ func (s *store) AuthorizePipelineActor(
 	}
 	if err := s.db.QueryRowContext(ctx,
 		`SELECT COUNT(*) FROM spindle_members
-          WHERE did = ? AND subject = ?`,
-		ownerDID, repoOwnerDID,
+		  WHERE did = ? AND instance = ? AND subject = ?`,
+		ownerDID, hostname, repoOwnerDID,
 	).Scan(&n); err != nil {
 		return false, "", fmt.Errorf("count membership: %w", err)
 	}
@@ -308,12 +438,12 @@ func (s *store) IsKnotWanted(ctx context.Context, hostname, ownerDID, knot strin
           WHERE r.spindle = ? AND r.knot = ?
             AND (
                 r.did = ?
-                OR EXISTS (
-                    SELECT 1 FROM spindle_members m
-                     WHERE m.did = ? AND m.subject = r.did
-                )
-            )`,
-		hostname, knot, ownerDID, ownerDID,
+				 OR EXISTS (
+					 SELECT 1 FROM spindle_members m
+					  WHERE m.did = ? AND m.instance = ? AND m.subject = r.did
+				 )
+			 )`,
+		hostname, knot, ownerDID, ownerDID, hostname,
 	).Scan(&n)
 	if err != nil {
 		return false, fmt.Errorf("count repos for knot: %w", err)
@@ -329,7 +459,10 @@ func (s *store) IsKnotWanted(ctx context.Context, hostname, ownerDID, knot strin
 // access. This is the same trust rule AuthorizePipelineActor enforces;
 // it's pulled out here so knot-subscription decisions in jetstream.go
 // gate on the same check as pipeline-spawning decisions in knot.go.
-func (s *store) IsAuthorizedActor(ctx context.Context, ownerDID, did string) (bool, error) {
+func (s *store) IsAuthorizedActor(
+	ctx context.Context,
+	hostname, ownerDID, did string,
+) (bool, error) {
 	if did == "" {
 		return false, nil
 	}
@@ -339,8 +472,8 @@ func (s *store) IsAuthorizedActor(ctx context.Context, ownerDID, did string) (bo
 	var n int
 	err := s.db.QueryRowContext(ctx,
 		`SELECT COUNT(*) FROM spindle_members
-          WHERE did = ? AND subject = ?`,
-		ownerDID, did,
+		  WHERE did = ? AND instance = ? AND subject = ?`,
+		ownerDID, hostname, did,
 	).Scan(&n)
 	if err != nil {
 		return false, fmt.Errorf("count membership: %w", err)
@@ -419,12 +552,12 @@ func (s *store) KnotsForSpindle(ctx context.Context, hostname, ownerDID string) 
           WHERE r.spindle = ? AND r.knot <> ''
             AND (
                 r.did = ?
-                OR EXISTS (
-                    SELECT 1 FROM spindle_members m
-                     WHERE m.did = ? AND m.subject = r.did
-                )
-            )`,
-		hostname, ownerDID, ownerDID,
+				 OR EXISTS (
+					 SELECT 1 FROM spindle_members m
+					  WHERE m.did = ? AND m.instance = ? AND m.subject = r.did
+				 )
+			 )`,
+		hostname, ownerDID, ownerDID, hostname,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("query knots: %w", err)
@@ -458,62 +591,86 @@ func (s *store) DeleteRepoCollaborator(ctx context.Context, did, rkey string) er
 	return nil
 }
 
-// EventRow is one row of the events table. It represents an outbound
-// record we want to deliver to /events websocket subscribers, in the
-// shape callers actually need (raw record JSON, not stringly-typed).
+// ApplyKnotCollaborator mirrors the authoritative ACL update emitted by the
+// knot that owns repo. These events replaced PDS collaborator records for
+// current knots, but use the same table so XRPC authorization has one source.
+func (s *store) ApplyKnotCollaborator(
+	ctx context.Context,
+	repo *RepoRef,
+	subject string,
+	add bool,
+) error {
+	if !add {
+		_, err := s.db.ExecContext(ctx, `
+			DELETE FROM repo_collaborators
+			WHERE repo_did = ? AND subject = ?`, repo.RepoDID, subject,
+		)
+		if err != nil {
+			return fmt.Errorf("delete knot collaborator: %w", err)
+		}
+		return nil
+	}
+	return s.UpsertRepoCollaborator(
+		ctx,
+		repo.OwnerDID,
+		"knot:"+repo.RepoDID+":"+subject,
+		repo.RepoDID,
+		repo.RepoDID,
+		subject,
+		time.Now().UTC().Format(time.RFC3339Nano),
+	)
+}
+
+// EventRow is one retained spindle-owned pipeline or status record.
 type EventRow struct {
-	// Created is the assigned monotonic rowid; doubles as the cursor
-	// value subscribers use to resume.
+	// Created is the assigned monotonic Unix-nanosecond ordering key.
 	Created int64
 	// Rkey is the ATProto record key. For sh.tangled.pipeline.status
 	// records this is the rkey we mint when publishing.
 	Rkey string
 	// Nsid is the lexicon collection (e.g. sh.tangled.pipeline.status).
 	Nsid string
-	// EventJSON is the record body verbatim — held as RawMessage so
-	// the /events handler can splice it into the wire envelope without
-	// an unmarshal/remarshal round-trip.
+	// EventJSON is the record body verbatim.
 	EventJSON json.RawMessage
 }
 
-// InsertEvent appends an event row and returns its assigned `created`
-// (rowid) cursor. Storage is the source of truth for fan-out, so we
-// write here even if zero subscribers are connected — a subscriber that
-// connects later (with an old cursor) will pick the row up via
-// EventsAfter.
+// InsertEvent appends an event row and returns its assigned created value.
+// Storage is the source of truth for pipeline queries and status projection.
 //
 // eventJSON must be a valid JSON object; we store it verbatim. Length
 // validation is intentionally absent — the schema accepts arbitrary
 // TEXT and SQLite handles huge blobs fine for our scale.
 func (s *store) InsertEvent(ctx context.Context, rkey, nsid string, eventJSON []byte) (int64, error) {
-	res, err := s.db.ExecContext(ctx,
-		`INSERT INTO events (rkey, nsid, event_json, inserted_at)
-         VALUES (?, ?, ?, ?)`,
-		rkey, nsid, string(eventJSON),
+	s.eventMu.Lock()
+	defer s.eventMu.Unlock()
+
+	now := time.Now().UnixNano()
+	if now <= s.lastEventNanos {
+		now = s.lastEventNanos + 1
+	}
+	_, err := s.db.ExecContext(ctx,
+		`INSERT INTO events (created, rkey, nsid, event_json, inserted_at)
+		 VALUES (?, ?, ?, ?, ?)`,
+		now, rkey, nsid, string(eventJSON),
 		time.Now().UTC().Format(time.RFC3339Nano),
 	)
 	if err != nil {
 		return 0, fmt.Errorf("insert event: %w", err)
 	}
-	id, err := res.LastInsertId()
-	if err != nil {
-		return 0, fmt.Errorf("event last insert id: %w", err)
-	}
-	return id, nil
+	s.lastEventNanos = now
+	return now, nil
 }
 
 // BuildkiteBuildRef is the persisted mapping from one Buildkite build
 // to the Tangled pipeline tuple that spawned it. It's the row written
-// by the Buildkite provider at Spawn time and read back from two
-// places: the webhook handler (by build UUID) when an event arrives,
-// and the /logs handler (by knot+rkey+workflow) when an appview
-// client asks for output.
+// by the Buildkite provider at Spawn time and read by the webhook handler and
+// CI log subscription.
 type BuildkiteBuildRef struct {
 	BuildUUID    string
 	BuildNumber  int64
 	PipelineSlug string
 	// Org is the Buildkite organisation slug the build was created
-	// against. Persisted at Spawn time so /logs and any other
+	// against. Persisted at Spawn time so log subscriptions and any other
 	// post-creation API call can target the same org the workflow
 	// originally chose — see the workflow YAML `tack.buildkite.org`
 	// override. Empty means "use the provider's default org", which
@@ -623,8 +780,8 @@ func (s *store) LookupBuildkiteBuildByUUID(ctx context.Context, buildUUID string
 
 // LookupBuildkiteBuildByTuple finds the most recently created build
 // for (knot, pipelineRkey, workflow). Returns nil when no build has
-// been recorded for that tuple — used by /logs to translate the
-// appview's path-based identity back into something Buildkite knows.
+// been recorded for that tuple. Log subscriptions use it to translate the
+// spindle pipeline identity back into something Buildkite knows.
 //
 // "Most recent" matters because a workflow may have multiple builds
 // over time (rebuilds, re-triggers). We always serve logs for the
@@ -662,7 +819,7 @@ func (s *store) LookupBuildkiteBuildByTuple(ctx context.Context, knot, pipelineR
 
 // InsertTektonRun records the latest PipelineRun created for a Tangled
 // workflow tuple. Reusing the tuple as the primary key intentionally
-// makes /logs resolve to the newest run for that workflow identity.
+// makes log subscriptions resolve to the newest run for that workflow identity.
 func (s *store) InsertTektonRun(ctx context.Context, ref TektonRunRef) error {
 	now := time.Now().UTC()
 	_, err := s.db.ExecContext(ctx,
@@ -691,7 +848,7 @@ func (s *store) InsertTektonRun(ctx context.Context, ref TektonRunRef) error {
 
 // InsertSourcehutJob records the latest builds.sr.ht job submitted for
 // a Tangled workflow tuple. Reusing the tuple as the primary key
-// intentionally makes /logs resolve to the newest job for that workflow
+// intentionally makes log subscriptions resolve to the newest job for that workflow
 // identity — same behaviour as InsertTektonRun.
 func (s *store) InsertSourcehutJob(ctx context.Context, ref SourcehutJobRef) error {
 	now := time.Now().UTC()
@@ -718,8 +875,8 @@ func (s *store) InsertSourcehutJob(ctx context.Context, ref SourcehutJobRef) err
 	return nil
 }
 
-// LookupSourcehutJobByTuple resolves the appview's path-based identity
-// back to the concrete builds.sr.ht job tack submitted for it.
+// LookupSourcehutJobByTuple resolves a workflow identity to the concrete
+// builds.sr.ht job Tack submitted for it.
 func (s *store) LookupSourcehutJobByTuple(ctx context.Context, knot, pipelineRkey, workflow string) (*SourcehutJobRef, error) {
 	var ref SourcehutJobRef
 	err := s.db.QueryRowContext(ctx,
@@ -741,8 +898,8 @@ func (s *store) LookupSourcehutJobByTuple(ctx context.Context, knot, pipelineRke
 	return &ref, nil
 }
 
-// LookupTektonRunByTuple resolves the appview's path-based identity to
-// the concrete PipelineRun tack created in Kubernetes.
+// LookupTektonRunByTuple resolves a workflow identity to the concrete
+// PipelineRun Tack created in Kubernetes.
 func (s *store) LookupTektonRunByTuple(ctx context.Context, knot, pipelineRkey, workflow string) (*TektonRunRef, error) {
 	var ref TektonRunRef
 	err := s.db.QueryRowContext(ctx,
@@ -766,13 +923,8 @@ func (s *store) LookupTektonRunByTuple(ctx context.Context, knot, pipelineRkey, 
 	return &ref, nil
 }
 
-// EventsAfter returns every event row with `created` strictly greater
-// than cursor, in cursor order. Used by /events to backfill a
-// reconnecting subscriber and to drain newly-published rows on each
-// broker notification.
-//
-// Pass cursor=0 to get the full log from the beginning, which is what
-// happens when a subscriber connects without a ?cursor= query param.
+// EventsAfter returns every event row with created strictly greater than
+// cursor. Provider and persistence tests use it to inspect published records.
 func (s *store) EventsAfter(ctx context.Context, cursor int64) ([]EventRow, error) {
 	rows, err := s.db.QueryContext(ctx,
 		`SELECT created, rkey, nsid, event_json

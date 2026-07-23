@@ -60,9 +60,8 @@ CREATE TABLE IF NOT EXISTS repo_collaborators (
     PRIMARY KEY (did, rkey)
 );
 
--- Outbound event log. Each row is one record we want to fan out to
--- connected /events websocket subscribers (typically the Tangled
--- appview) — today only sh.tangled.pipeline.status.
+-- Spindle-owned event log. Pipeline definitions and their status updates live
+-- here so the sh.tangled.ci query APIs can answer without appview-owned state.
 --
 -- We persist instead of pushing through an in-memory channel so that
 -- (a) a reconnecting subscriber can resume from a cursor without
@@ -70,9 +69,8 @@ CREATE TABLE IF NOT EXISTS repo_collaborators (
 -- (b) slow subscribers can't make us drop events for fast ones — they
 --     simply lag behind in the rowid space.
 --
--- AUTOINCREMENT (vs plain INTEGER PRIMARY KEY) guarantees rowids
--- strictly increase and never get reused if a row is ever deleted, so
--- treating the created column as a monotonic cursor is safe forever.
+-- created is an explicitly assigned monotonic Unix-nanosecond timestamp used
+-- for stable ordering and pagination.
 CREATE TABLE IF NOT EXISTS events (
     created     INTEGER PRIMARY KEY AUTOINCREMENT,
     rkey        TEXT NOT NULL,
@@ -80,6 +78,8 @@ CREATE TABLE IF NOT EXISTS events (
     event_json  TEXT NOT NULL,
     inserted_at TEXT NOT NULL
 );
+CREATE INDEX IF NOT EXISTS events_nsid_rkey
+    ON events (nsid, rkey);
 
 -- Mapping from a Buildkite build back to the Tangled pipeline that
 -- spawned it. The Buildkite webhook receiver only knows the build
@@ -92,19 +92,19 @@ CREATE TABLE IF NOT EXISTS events (
 -- every event — it's a constant for the lifetime of the build and
 -- the webhook is the hot path for status fan-out.
 --
--- The (knot, pipeline_rkey, workflow) index supports the /logs
--- handler, which only knows that tuple at request time.
+-- The (knot, pipeline_rkey, workflow) index supports log subscriptions,
+-- which only know that tuple at request time.
 -- org is the Buildkite organisation slug the build was created
 -- against. A workflow's YAML can override the spindle's default
 -- org via tack.buildkite.org, so we persist whatever was used at
--- Spawn time and read it back when fetching jobs/logs. The empty
+-- Spawn time and read it back when fetching jobs and logs. The empty
 -- string means "use the provider's defaultOrg" — that's both the
 -- usual single-org case and what every row written before this
 -- column existed will scan as.
 -- created_unix_ns is the monotonic recency key. created_at is kept
 -- (RFC3339Nano text) for human-readable inspection, but it must NOT
 -- be used for ordering: text comparison of nanosecond timestamps is
--- not reliable, which used to make /logs occasionally resolve the
+-- not reliable, which used to make log subscriptions occasionally resolve the
 -- wrong run. created_unix_ns is the integer the latest-build lookup
 -- sorts on instead.
 CREATE TABLE IF NOT EXISTS buildkite_builds (
@@ -125,7 +125,7 @@ CREATE INDEX IF NOT EXISTS buildkite_builds_lookup
 -- Mapping from a Tangled workflow tuple to the latest Tekton
 -- PipelineRun tack created for it. Unlike Buildkite webhooks, Tekton
 -- status observation happens in-process, so the primary read path is
--- /logs resolving (knot, pipeline_rkey, workflow) back to the concrete
+-- log subscriptions resolving (knot, pipeline_rkey, workflow) back to the concrete
 -- PipelineRun whose TaskRuns and pods hold output.
 CREATE TABLE IF NOT EXISTS tekton_runs (
     knot              TEXT NOT NULL,
@@ -146,7 +146,7 @@ CREATE INDEX IF NOT EXISTS tekton_runs_uid
 -- Mapping from a Tangled workflow tuple to the latest builds.sr.ht
 -- job tack submitted for it. Same shape as tekton_runs: like Tekton,
 -- sourcehut is observed by polling rather than webhooks, so the read
--- path is purely tuple → job_id resolution at /logs and watch time.
+-- path is purely tuple → job_id resolution at subscription and watch time.
 -- instance is the builds.sr.ht-compatible base URL the job lives on
 -- (job IDs are scoped to one instance), preserved per-row so a later
 -- change to the provider's default instance can't silently retarget
@@ -181,7 +181,7 @@ func (s *store) migrate(ctx context.Context) error {
 	}
 	for _, alter := range []string{
 		// Persist the Buildkite org each build was created
-		// against so /logs can target the same org the workflow
+		// against so log subscriptions can target the same org the workflow
 		// chose. Pre-existing rows scan as empty string, which
 		// the provider treats as "use defaultOrg".
 		`ALTER TABLE buildkite_builds ADD COLUMN org TEXT NOT NULL DEFAULT ''`,
@@ -189,7 +189,7 @@ func (s *store) migrate(ctx context.Context) error {
 		// Monotonic integer ordering key for buildkite_builds.
 		// Replaces ORDER BY created_at (RFC3339Nano text), whose
 		// lexical order isn't reliable across nanosecond precision
-		// and could make /logs resolve the wrong run. Default 0
+		// and could make log subscriptions resolve the wrong run. Default 0
 		// covers pre-existing rows; the backfill below promotes
 		// them to their parsed timestamp so ordering stays stable
 		// across the upgrade.

@@ -36,7 +36,7 @@ var APIBase = "https://api.buildkite.com"
 
 // ErrNotFound is returned by Get* methods when the upstream returns
 // 404. Callers translate it to whatever shape they need (the Provider
-// maps it onto its own ErrLogsNotFound for the /logs handler).
+// maps it onto its own ErrLogsNotFound for the log subscription handler).
 var ErrNotFound = errors.New("buildkite: not found")
 
 // Client is a thin wrapper around net/http carrying API credentials.

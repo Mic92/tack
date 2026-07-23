@@ -12,16 +12,17 @@ package main
 //   - sh.tangled.spindle.member       — owner authorizes a DID to use us
 //   - sh.tangled.repo                 — a repo declares us as its spindle
 //   - sh.tangled.repo.collaborator    — collaborators on those repos
+//   - sh.tangled.repo.pull            — branch-based pull request triggers
 //
-// (Pipeline trigger records, sh.tangled.pipeline, do *not* come over
-// jetstream; they're delivered by the knot servers via a separate event
-// stream. That is plumbed in separately.)
+// (CI triggers do not come over jetstream. Knots publish git.refUpdate on
+// their event streams; Tack turns those into spindle-owned pipelines.)
 
 import (
 	"context"
 	"encoding/json"
 	"fmt"
 
+	"github.com/bluesky-social/indigo/atproto/syntax"
 	jsmodels "github.com/bluesky-social/jetstream/pkg/models"
 	js "go.mitchellh.com/tack/internal/jetstream"
 	"tangled.org/core/api/tangled"
@@ -44,6 +45,7 @@ var jetstreamCollections = []string{
 	tangled.SpindleMemberNSID,
 	tangled.RepoNSID,
 	tangled.RepoCollaboratorNSID,
+	tangled.RepoPullNSID,
 }
 
 // startJetstream dials the configured jetstream endpoint and spawns a
@@ -59,7 +61,7 @@ var jetstreamCollections = []string{
 //
 // The logger is pulled from ctx (see log.go); falls back to slog.Default()
 // if none is attached.
-func startJetstream(ctx context.Context, cfg config, st *store, knots KnotConsumer) error {
+func startJetstream(ctx context.Context, cfg config, st *store, knots *knotConsumer) error {
 	logger := loggerFrom(ctx).With("component", "jetstream")
 
 	// The handler closes over `st`, `knots`, the spindle hostname and
@@ -68,7 +70,7 @@ func startJetstream(ctx context.Context, cfg config, st *store, knots KnotConsum
 	// consumer new sources as soon as matching repo records arrive
 	// (gated on the publisher being an authorized actor).
 	handler := js.HandlerFunc(func(ctx context.Context, evt *jsmodels.Event) error {
-		return applyCommit(ctx, st, knots, cfg.Hostname, cfg.OwnerDID, evt)
+		return applyCommit(ctx, st, knots, knots.pipelines, cfg.Hostname, cfg.OwnerDID, evt)
 	})
 
 	// Re-attach the component-scoped logger so handler — which the
@@ -89,15 +91,43 @@ func startJetstream(ctx context.Context, cfg config, st *store, knots KnotConsum
 
 // applyCommit routes a commit to the right store mutation based on its
 // collection NSID and operation.
-func applyCommit(ctx context.Context, st *store, knots KnotConsumer, hostname, ownerDID string, evt *jsmodels.Event) error {
+func applyCommit(
+	ctx context.Context,
+	st *store,
+	knots KnotConsumer,
+	pipelines *pipelineService,
+	hostname, ownerDID string,
+	evt *jsmodels.Event,
+) error {
 	c := evt.Commit
 	switch c.Collection {
 	case tangled.SpindleMemberNSID:
 		return applySpindleMember(ctx, st, knots, hostname, ownerDID, evt.Did, c)
 	case tangled.RepoNSID:
-		return applyRepo(ctx, st, knots, hostname, ownerDID, evt.Did, c)
+		err := applyRepo(ctx, st, knots, hostname, ownerDID, evt.Did, c)
+		if err == nil && pipelines != nil {
+			pipelines.invalidateRepoVerificationCache()
+		}
+		return err
 	case tangled.RepoCollaboratorNSID:
 		return applyRepoCollaborator(ctx, st, evt.Did, c)
+	case tangled.RepoPullNSID:
+		if pipelines == nil || (c.Operation != jsOpCreate && c.Operation != jsOpUpdate) {
+			return nil
+		}
+		var record tangled.RepoPull
+		if err := json.Unmarshal(c.Record, &record); err != nil {
+			return js.BadRecord(fmt.Errorf("decode repo.pull: %w", err))
+		}
+		if err := pipelines.processPull(ctx, evt.Did, c.RKey, &record); err != nil {
+			// Pull records are immutable inputs from a PDS. As in the stock
+			// spindle, log failures and advance rather than wedging the
+			// Jetstream cursor on one unavailable blob.
+			loggerFrom(ctx).Warn("failed to trigger pull request pipeline",
+				"err", err, "did", evt.Did, "rkey", c.RKey,
+			)
+		}
+		return nil
 	default:
 		// Server-side filter should prevent this, but log so we notice
 		// if jetstream ever changes behavior.
@@ -169,6 +199,11 @@ func applyRepo(ctx context.Context, st *store, knots KnotConsumer, hostname, own
 			// See applySpindleMember: decode errors are permanent.
 			return js.BadRecord(fmt.Errorf("decode repo: %w", err))
 		}
+		if rec.RepoDid != nil && *rec.RepoDid != "" {
+			if _, err := syntax.ParseDID(*rec.RepoDid); err != nil {
+				return js.BadRecord(fmt.Errorf("invalid repo DID %q: %w", *rec.RepoDid, err))
+			}
+		}
 
 		// Capture the prior (knot, spindle) before the upsert so the
 		// post-mutation reconcile below can detect transitions like
@@ -180,7 +215,7 @@ func applyRepo(ctx context.Context, st *store, knots KnotConsumer, hostname, own
 		}
 
 		if err := st.UpsertRepo(ctx, did, c.RKey,
-			rec.Knot, rec.Name,
+			rec.Knot, deref(rec.Name),
 			deref(rec.Spindle), deref(rec.RepoDid),
 			rec.CreatedAt,
 		); err != nil {
@@ -245,7 +280,7 @@ func reconcileKnot(
 	}
 
 	if newSpindle == hostname && newKnot != "" {
-		ok, err := st.IsAuthorizedActor(ctx, ownerDID, publisherDID)
+		ok, err := st.IsAuthorizedActor(ctx, hostname, ownerDID, publisherDID)
 		if err != nil {
 			return err
 		}
@@ -308,7 +343,7 @@ func reconcileMember(
 	if len(knotsForSubject) == 0 {
 		return nil
 	}
-	authorized, err := st.IsAuthorizedActor(ctx, ownerDID, subject)
+	authorized, err := st.IsAuthorizedActor(ctx, hostname, ownerDID, subject)
 	if err != nil {
 		return err
 	}
@@ -336,9 +371,11 @@ func applyRepoCollaborator(ctx context.Context, st *store, did string, c *jsmode
 			// See applySpindleMember: decode errors are permanent.
 			return js.BadRecord(fmt.Errorf("decode repo.collaborator: %w", err))
 		}
-		return st.UpsertRepoCollaborator(ctx, did, c.RKey,
-			deref(rec.Repo), deref(rec.RepoDid),
-			rec.Subject, rec.CreatedAt,
+		if _, err := syntax.ParseDID(rec.Repo); err != nil {
+			return js.BadRecord(fmt.Errorf("invalid collaborator repo DID %q: %w", rec.Repo, err))
+		}
+		return st.UpsertRepoCollaborator(
+			ctx, did, c.RKey, rec.Repo, rec.Repo, rec.Subject, rec.CreatedAt,
 		)
 	case jsOpDelete:
 		return st.DeleteRepoCollaborator(ctx, did, c.RKey)

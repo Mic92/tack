@@ -24,7 +24,7 @@ const DefaultBaseURL = "https://builds.sr.ht"
 // ErrNotFound is returned by Get* methods when the upstream returns
 // 404 (or, for GraphQL, when the requested job's `job` field comes
 // back null). The Provider maps this onto its own ErrLogsNotFound
-// for the /logs handler.
+// for the log subscription handler.
 var ErrNotFound = errors.New("sourcehut: not found")
 
 // ErrUnauthorized is returned by Get* methods when the upstream rejects

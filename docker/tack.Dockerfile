@@ -1,4 +1,4 @@
-FROM golang:1.25.7-trixie AS build
+FROM golang:1.25.9-trixie AS build
 
 WORKDIR /app
 
@@ -14,10 +14,10 @@ FROM debian:trixie-slim AS run
 
 ARG DEBIAN_FRONTEND=noninteractive
 
-# Tack talks to HTTPS endpoints at runtime; the slim Debian base intentionally
-# omits the CA bundle, so install only that and drop apt's transient indexes.
+# Tack talks to HTTPS endpoints and uses sparse Git checkouts to load workflow
+# definitions at the triggered revision.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates \
+    && apt-get install -y --no-install-recommends ca-certificates git \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=build /app/bin/tack /app/bin/tack
