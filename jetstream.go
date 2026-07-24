@@ -106,6 +106,8 @@ func applyCommit(
 	case tangled.RepoNSID:
 		err := applyRepo(ctx, st, knots, hostname, ownerDID, evt.Did, c)
 		if err == nil && pipelines != nil {
+			// A repo update can change knot, owner, rkey, or spindle assignment.
+			// Canonical verification cache entries must not outlive that mutation.
 			pipelines.invalidateRepoVerificationCache()
 		}
 		return err
@@ -137,6 +139,10 @@ func applyCommit(
 	}
 }
 
+// applySpindleMember mirrors owner-issued membership records and immediately
+// reconciles knot subscriptions affected by grants, revocations, or same-rkey
+// subject changes. Records from non-owners are retained for faithful mirroring
+// but never influence authorization.
 func applySpindleMember(ctx context.Context, st *store, knots KnotConsumer, hostname, ownerDID, did string, c *jsmodels.Commit) error {
 	switch c.Operation {
 	case jsOpCreate, jsOpUpdate:
@@ -191,6 +197,9 @@ func applySpindleMember(ctx context.Context, st *store, knots KnotConsumer, host
 	return nil
 }
 
+// applyRepo mirrors one sh.tangled.repo record and reconciles both sides of a
+// knot/spindle transition. The previous routing values are read before the
+// mutation so moving away from Tack can release an otherwise stale connection.
 func applyRepo(ctx context.Context, st *store, knots KnotConsumer, hostname, ownerDID, did string, c *jsmodels.Commit) error {
 	switch c.Operation {
 	case jsOpCreate, jsOpUpdate:
@@ -363,6 +372,10 @@ func reconcileMember(
 	return nil
 }
 
+// applyRepoCollaborator mirrors legacy PDS collaborator records. Current knots
+// also emit authoritative collaboratorUpdate events; both shapes share one
+// table, and authorization requires the collaborator publisher to match the
+// canonical repo owner before either can grant trigger access.
 func applyRepoCollaborator(ctx context.Context, st *store, did string, c *jsmodels.Commit) error {
 	switch c.Operation {
 	case jsOpCreate, jsOpUpdate:

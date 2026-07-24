@@ -199,6 +199,10 @@ func (k *knotConsumer) seedCursorIfMissing(source eventconsumer.Source) {
 	)
 }
 
+// source canonicalizes a persisted knot string into the exact source identity
+// used for add/remove/cursor keys. Dev mode is applied here rather than in the
+// upstream consumer config because current eventconsumer stores TLS policy on
+// each Source.
 func (k *knotConsumer) source(knot string) eventconsumer.Source {
 	source := eventconsumer.NewKnotSource(knot)
 	if k.dev {
@@ -284,6 +288,10 @@ func (k *knotConsumer) process(
 	return nil
 }
 
+// retryPipelineEvent compensates for eventconsumer's at-most-once callback
+// semantics: its cursor advances even when ProcessFunc returns an error. Keep a
+// copy of transiently failed work in memory and retry with bounded exponential
+// delays, stopping immediately when Tack shuts down.
 func (k *knotConsumer) retryPipelineEvent(
 	kind string,
 	process func(context.Context) error,

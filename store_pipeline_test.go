@@ -8,6 +8,8 @@ import (
 	"tangled.org/core/api/tangled"
 )
 
+// TestPipelineQueriesMapStatus covers legacy-record projection, status/timestamp
+// aggregation, trigger filtering, and newest-retry-per-commit semantics.
 func TestPipelineQueriesMapStatus(t *testing.T) {
 	st := newTestStore(t)
 	br := newBroker(st)
@@ -78,6 +80,8 @@ func TestPipelineQueriesMapStatus(t *testing.T) {
 	}
 }
 
+// publishRecord keeps test setup on the same marshal/persist boundary used by
+// providers without making each case repeat error handling.
 func publishRecord(t *testing.T, ctx context.Context, br *broker, rkey, nsid string, record any) {
 	t.Helper()
 	encoded, err := json.Marshal(record)

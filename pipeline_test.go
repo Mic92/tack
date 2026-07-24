@@ -11,6 +11,9 @@ import (
 	"testing"
 )
 
+// TestSyncWorkflowRepo exercises the Git 2.47-compatible init/fetch sequence
+// against a real local repository and confirms sparse checkout materializes the
+// workflow directory at the requested revision.
 func TestSyncWorkflowRepo(t *testing.T) {
 	ctx := context.Background()
 	source := filepath.Join(t.TempDir(), "source")
@@ -54,6 +57,8 @@ func TestSyncWorkflowRepo(t *testing.T) {
 	}
 }
 
+// TestPipelineHTTPClientRejectsPrivateAddresses pins the SSRF boundary while
+// preserving loopback access required by local development mode.
 func TestPipelineHTTPClientRejectsPrivateAddresses(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)

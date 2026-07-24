@@ -32,8 +32,9 @@ import (
 type store struct {
 	db *sql.DB
 
-	// eventMu makes event cursors strictly monotonic even when two provider
-	// callbacks publish within the same clock tick.
+	// eventMu makes event creation values strictly monotonic even when two
+	// provider callbacks publish within the same clock tick. lastEventNanos is
+	// initialized from disk so the guarantee survives restarts and clock skew.
 	eventMu        sync.Mutex
 	lastEventNanos int64
 }
@@ -64,6 +65,9 @@ func openStore(path string) (*store, error) {
 		_ = db.Close()
 		return nil, err
 	}
+	// Existing databases used small AUTOINCREMENT rowids. Unix nanoseconds are
+	// naturally greater, while loading MAX also handles a clock moving backwards
+	// after a restart without reusing an ordering key.
 	if err := db.QueryRow(`SELECT COALESCE(MAX(created), 0) FROM events`).Scan(&s.lastEventNanos); err != nil {
 		_ = db.Close()
 		return nil, fmt.Errorf("load event clock: %w", err)
@@ -298,6 +302,10 @@ func (s *store) ManagedRepoByDID(
 	return &repo, nil
 }
 
+// HasManagedRepo is the cheap, local half of repository authorization. Trigger
+// paths call it before DID/network verification so arbitrary global knot or
+// Jetstream events cannot force resolver traffic for repositories Tack does not
+// serve.
 func (s *store) HasManagedRepo(
 	ctx context.Context,
 	repoDID, hostname, ownerDID string,

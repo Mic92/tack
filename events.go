@@ -9,6 +9,9 @@ type broker struct {
 	st *store
 }
 
+// newBroker binds publishers to the durable store. The name remains useful even
+// though current appviews query rather than subscribe: providers should not
+// need direct knowledge of the events table.
 func newBroker(st *store) *broker {
 	return &broker{st: st}
 }

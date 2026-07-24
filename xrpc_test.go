@@ -12,6 +12,8 @@ import (
 	"tangled.org/core/api/tangled"
 )
 
+// TestCiLogEventCBORRoundTrip verifies our provider-neutral log conversion is
+// consumable by Tangled's generated subscription decoder.
 func TestCiLogEventCBORRoundTrip(t *testing.T) {
 	original := ciLogEvent("ci.yml", LogLine{
 		Kind:    LogKindData,
@@ -35,12 +37,17 @@ func TestCiLogEventCBORRoundTrip(t *testing.T) {
 	}
 }
 
+// delayedLogsProvider models the real startup race where a pipeline exists
+// before an asynchronous provider has persisted its run-to-log mapping.
 type delayedLogsProvider struct {
 	broker *broker
 	calls  int
 	err    error
 }
 
+var _ Provider = (*delayedLogsProvider)(nil)
+
+// Spawn is unused by log-follower tests.
 func (p *delayedLogsProvider) Spawn(
 	context.Context,
 	string,
@@ -51,6 +58,8 @@ func (p *delayedLogsProvider) Spawn(
 ) {
 }
 
+// Logs fails its first lookup, then publishes a terminal status and returns one
+// line. That is the shortest faithful model of asynchronous provider startup.
 func (p *delayedLogsProvider) Logs(
 	ctx context.Context,
 	knot, pipeline, workflow string,
@@ -75,6 +84,9 @@ func (p *delayedLogsProvider) Logs(
 	return lines, nil
 }
 
+// TestFollowProviderLogsWaitsForProviderMapping confirms ErrLogsNotFound is
+// retried while status is non-terminal and does not prematurely close the
+// subscription.
 func TestFollowProviderLogsWaitsForProviderMapping(t *testing.T) {
 	st := newTestStore(t)
 	provider := &delayedLogsProvider{broker: newBroker(st)}
@@ -99,6 +111,7 @@ func TestFollowProviderLogsWaitsForProviderMapping(t *testing.T) {
 	}
 }
 
+// TestLogPollBackoff pins the rate-limit-friendly capped delay sequence.
 func TestLogPollBackoff(t *testing.T) {
 	for _, test := range []struct {
 		failures int
@@ -115,6 +128,8 @@ func TestLogPollBackoff(t *testing.T) {
 	}
 }
 
+// TestTriggerPipelineCreatesSpindleOwnedRecord covers authenticated manual
+// trigger conversion, durable pipeline creation, and provider dispatch.
 func TestTriggerPipelineCreatesSpindleOwnedRecord(t *testing.T) {
 	st := newTestStore(t)
 	ctx := context.Background()
@@ -178,6 +193,8 @@ func TestTriggerPipelineCreatesSpindleOwnedRecord(t *testing.T) {
 	}
 }
 
+// TestPullRecordCreatesPipeline covers branch-based pull conversion and proves
+// replaying the same pull/SHA cannot create a duplicate provider run.
 func TestPullRecordCreatesPipeline(t *testing.T) {
 	st := newTestStore(t)
 	ctx := context.Background()

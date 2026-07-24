@@ -38,8 +38,14 @@ import (
 	"tangled.org/core/workflow"
 )
 
+// errNoMatchingWorkflows distinguishes a valid trigger that selected nothing
+// from an operational failure. Push and pull consumers silently skip the former;
+// explicit XRPC triggers surface it to the caller as a rejected request.
 var errNoMatchingWorkflows = errors.New("no workflows matched the trigger")
 
+// workflowLoader is replaceable in tests so trigger/auth behavior can be
+// exercised without cloning a repository. Production always uses
+// pipelineService.loadWorkflows.
 type workflowLoader func(
 	context.Context,
 	*RepoRef,
@@ -48,6 +54,9 @@ type workflowLoader func(
 	[]string,
 ) ([]*tangled.Pipeline_Workflow, error)
 
+// pullRevisionFetcher isolates the network/blob work needed to recover the
+// source commit from a pull round. Keeping it injectable makes pull-trigger
+// tests deterministic and avoids constructing signed ATProto blobs there.
 type pullRevisionFetcher func(
 	context.Context,
 	string,
@@ -55,13 +64,25 @@ type pullRevisionFetcher func(
 	*tangled.RepoPull,
 ) (string, error)
 
+// verifiedRepoCache holds canonical repository identity data resolved from the
+// repo DID. Entries are short-lived because repository DIDs can migrate knots;
+// repo-record mutations also invalidate the entire cache immediately.
 type verifiedRepoCache struct {
 	repo    *RepoRef
 	expires time.Time
 }
 
+// pipelineService owns the post-1.13 Spindle pipeline lifecycle. It verifies
+// trigger provenance, checks out workflow definitions, persists the
+// spindle-owned pipeline record, and only then dispatches work to a Provider.
+//
+// The function-valued fields are production dependencies with test seams. The
+// two mutex domains deliberately stay separate: repoLocks serialize mutable Git
+// worktrees, while verifiedMu protects the short-lived identity cache.
 type pipelineService struct {
-	rootCtx              context.Context
+	// rootCtx outlives request contexts and scopes asynchronous provider work.
+	rootCtx context.Context
+	// httpClient rejects private-network PDS/knot targets outside dev mode.
 	httpClient           *http.Client
 	cfg                  config
 	store                *store
@@ -78,6 +99,9 @@ type pipelineService struct {
 	verifiedRepos        map[string]verifiedRepoCache
 }
 
+// newPipelineService wires production identity, HTTP, checkout, and compiler
+// dependencies. The service is shared by knot events, Jetstream pulls, and CI
+// XRPC procedures so every trigger path applies the same authorization rules.
 func newPipelineService(
 	rootCtx context.Context,
 	cfg config,
@@ -120,6 +144,8 @@ func (p *pipelineService) processRefUpdate(
 		"commit", event.NewSha,
 	)
 
+	// A refUpdate names only a repo DID. Resolve that DID through our mirrored
+	// assignment plus the canonical knot before trusting any event payload.
 	if _, err := syntax.ParseDID(event.Repo); err != nil {
 		return fmt.Errorf("invalid ref update repo DID %q: %w", event.Repo, err)
 	}
@@ -140,6 +166,8 @@ func (p *pipelineService) processRefUpdate(
 		return nil
 	}
 
+	// The knot already tells us whether this is the default ref, avoiding an
+	// extra XRPC round trip on the high-volume push path.
 	defaultBranch := ""
 	if event.Meta != nil && event.Meta.IsDefaultRef {
 		defaultBranch = strings.TrimPrefix(event.Ref, "refs/heads/")
@@ -175,6 +203,9 @@ func (p *pipelineService) processPull(
 	actor, rkey string,
 	record *tangled.RepoPull,
 ) error {
+	// Branch-based pulls check out the target repository directly. Fork-based
+	// pulls carry Source.Repo and must go through authenticated triggerPipeline,
+	// where the foreign source DID is independently verified.
 	if record.Target == nil || record.Source == nil || record.Source.Repo != nil {
 		return nil
 	}
@@ -197,6 +228,9 @@ func (p *pipelineService) processPull(
 		return fmt.Errorf("pull request source revision must be a 40-character commit hash")
 	}
 	pullURI := fmt.Sprintf("at://%s/%s/%s", actor, tangled.RepoPullNSID, rkey)
+	// Jetstream can replay a short window after reconnects, and metadata-only
+	// pull updates retain the same source SHA. Do not turn either into another
+	// externally billed CI run.
 	exists, err := p.store.HasPullPipeline(ctx, pullURI, sha)
 	if err != nil {
 		return err
@@ -221,6 +255,10 @@ func (p *pipelineService) processPull(
 	return err
 }
 
+// processKnotCollaborator mirrors authoritative knot ACL changes into the
+// local authorization table. The source-host comparison is load-bearing: a
+// different knot must not be able to grant access to a repository it does not
+// host.
 func (p *pipelineService) processKnotCollaborator(
 	ctx context.Context,
 	source eventconsumer.Source,
@@ -277,6 +315,9 @@ func (p *pipelineService) triggerPipeline(
 		return "", errors.New("trigger is required")
 	}
 
+	// Manual/retry payloads use the public ci.trigger union, while providers and
+	// the retained event format still consume Pipeline_TriggerMetadata. Convert
+	// between them once here so providers remain protocol-agnostic.
 	defaultBranch := p.resolveDefaultBranch(ctx, target)
 	trigger := &tangled.Pipeline_TriggerMetadata{
 		Repo: pipelineTriggerRepo(target, defaultBranch),
@@ -323,6 +364,8 @@ func (p *pipelineService) triggerPipeline(
 
 	source := target
 	if sourceRepoDID != "" && sourceRepoDID != target.RepoDID {
+		// A fork source is not required to assign itself to this spindle, but its
+		// DID must still resolve canonically before we construct a clone URL.
 		if _, err := syntax.ParseDID(sourceRepoDID); err != nil {
 			return "", fmt.Errorf("invalid source repository DID %q: %w", sourceRepoDID, err)
 		}
@@ -340,6 +383,10 @@ func (p *pipelineService) triggerPipeline(
 	return pipelineATURI(target.Knot, rkey), nil
 }
 
+// run is the common commit point for every trigger source. It compiles and
+// filters workflows, persists the immutable pipeline definition, and dispatches
+// the provider only after persistence succeeds so query/log requests can never
+// observe provider work without a corresponding pipeline.
 func (p *pipelineService) run(
 	ctx context.Context,
 	target, source *RepoRef,
@@ -352,6 +399,9 @@ func (p *pipelineService) run(
 		return "", fmt.Errorf("load workflows: %w", err)
 	}
 	if len(only) > 0 {
+		// Explicit retries may select one workflow from the original pipeline.
+		// Filter after compilation so ordinary trigger constraints and diagnostics
+		// still behave exactly like a full run.
 		allowed := make(map[string]struct{}, len(only))
 		for _, name := range only {
 			allowed[name] = struct{}{}
@@ -394,6 +444,10 @@ func (p *pipelineService) run(
 	return rkey, nil
 }
 
+// loadWorkflows checks out only .tangled/workflows at revision and runs the
+// upstream compiler with the trigger metadata and changed-file set. The lock is
+// held through both checkout and file reads: releasing it after checkout would
+// let a concurrent push replace the worktree before we finish compiling it.
 func (p *pipelineService) loadWorkflows(
 	ctx context.Context,
 	source *RepoRef,
@@ -410,6 +464,9 @@ func (p *pipelineService) loadWorkflows(
 		scheme = "http"
 	}
 	cloneURL := fmt.Sprintf("%s://%s/%s", scheme, host, source.RepoDID)
+	// Hash the DID instead of using it as a path component. Besides keeping
+	// paths short, this prevents malformed or future DID methods from escaping
+	// the configured cache directory.
 	repoHash := sha256.Sum256([]byte(source.RepoDID))
 	repoPath := filepath.Join(p.cfg.RepoDir, fmt.Sprintf("%x", repoHash[:]))
 	if err := os.MkdirAll(p.cfg.RepoDir, 0o700); err != nil {
@@ -453,6 +510,9 @@ func (p *pipelineService) loadWorkflows(
 	return compiled.Workflows, nil
 }
 
+// lockRepo acquires the mutex for one repository cache and returns its unlock
+// function. Locks are keyed by stable repo DID, so unrelated repositories can
+// compile concurrently while revisions of one repository remain serialized.
 func (p *pipelineService) lockRepo(repoDID string) func() {
 	p.repoLocksMu.Lock()
 	lock := p.repoLocks[repoDID]
@@ -470,6 +530,9 @@ func (p *pipelineService) lockRepo(repoDID string) func() {
 // trixie currently ships 2.47.
 func syncWorkflowRepo(ctx context.Context, cloneURL, repoPath, revision string) error {
 	gitDir := filepath.Join(repoPath, ".git")
+	// Initialize manually rather than cloning so Debian's pre-2.49 Git can use
+	// the same workflow. A non-Git cache directory is always disposable because
+	// repoPath is a Tack-owned hash beneath TACK_REPO_DIR.
 	if _, err := os.Stat(gitDir); errors.Is(err, os.ErrNotExist) {
 		if err := os.RemoveAll(repoPath); err != nil {
 			return fmt.Errorf("remove invalid repository cache: %w", err)
@@ -488,6 +551,8 @@ func syncWorkflowRepo(ctx context.Context, cloneURL, repoPath, revision string) 
 	} else if err != nil {
 		return fmt.Errorf("inspect repository cache: %w", err)
 	}
+	// Repository DIDs can migrate between knots. Refresh origin on every sync
+	// rather than letting a warm cache silently keep fetching the old host.
 	if err := runGit(ctx, "-C", repoPath, "remote", "set-url", "origin", cloneURL); err != nil {
 		return err
 	}
@@ -499,6 +564,9 @@ func syncWorkflowRepo(ctx context.Context, cloneURL, repoPath, revision string) 
 	return runGit(ctx, "-C", repoPath, "checkout", "--detach", "FETCH_HEAD")
 }
 
+// runGit executes one bounded-by-context Git operation and includes stderr in
+// failures. The latter is essential for diagnosing protocol/auth failures from
+// remote knots; os/exec's bare ExitError is otherwise nearly content-free.
 func runGit(ctx context.Context, args ...string) error {
 	command := exec.CommandContext(ctx, "git", args...)
 	output, err := command.CombinedOutput()
@@ -508,6 +576,9 @@ func runGit(ctx context.Context, args ...string) error {
 	return nil
 }
 
+// fetchLatestPullRevision downloads the newest pull round's format-patch blob
+// from its author's PDS and returns the final commit SHA. Both compressed and
+// expanded sizes are bounded because pull records are untrusted network input.
 func (p *pipelineService) fetchLatestPullRevision(
 	ctx context.Context,
 	did, rkey string,
@@ -566,6 +637,8 @@ func (p *pipelineService) fetchLatestPullRevision(
 		return "", fmt.Errorf("fetch pull request blob: unexpected HTTP status %s", response.Status)
 	}
 
+	// Limit the compressed stream and the expanded patch independently: a small
+	// gzip body can otherwise expand enough to exhaust the spindle.
 	reader, err := gzip.NewReader(io.LimitReader(response.Body, 16<<20))
 	if err != nil {
 		return "", fmt.Errorf("open pull request patch: %w", err)
@@ -591,6 +664,9 @@ func (p *pipelineService) fetchLatestPullRevision(
 	return patches[len(patches)-1].SHA, nil
 }
 
+// defaultBranch asks the authoritative knot for display/provider metadata used
+// by manual runs. Failure is intentionally soft: the requested SHA remains
+// sufficient to run, and providers can tolerate an empty branch.
 func (p *pipelineService) defaultBranch(ctx context.Context, repo *RepoRef) string {
 	host, noTLS, err := hostutil.ParseHostname(repo.Knot)
 	if err != nil {
@@ -608,6 +684,11 @@ func (p *pipelineService) defaultBranch(ctx context.Context, repo *RepoRef) stri
 	return result.Name
 }
 
+// newPipelineHTTPClient builds the client used for author-controlled PDS and
+// knot URLs. Production dials reject loopback, private, link-local, multicast,
+// and unspecified addresses after DNS resolution; dev mode deliberately allows
+// them for local-infrastructure testing. Redirects receive the same scheme and
+// address checks through this transport.
 func newPipelineHTTPClient(dev bool) *http.Client {
 	dialer := &net.Dialer{Timeout: 5 * time.Second, KeepAlive: 30 * time.Second}
 	if !dev {
@@ -642,6 +723,10 @@ func newPipelineHTTPClient(dev bool) *http.Client {
 	return client
 }
 
+// authorizeRepoActor first checks the local collaborator mirror, then queries
+// the authoritative knot on a miss. The fallback makes pre-existing knot ACLs
+// usable after a fresh Tack install, whose event cursor only sees later changes;
+// a successful lookup is mirrored locally for subsequent requests.
 func (p *pipelineService) authorizeRepoActor(
 	ctx context.Context,
 	repo *RepoRef,
@@ -691,6 +776,11 @@ func (p *pipelineService) authorizeRepoActor(
 	return false, errors.New("knot collaborator list exceeded 1000 entries")
 }
 
+// managedRepo performs a cheap local assignment check before network
+// verification, then requires the mirrored record to agree with the canonical
+// knot, owner, and record key resolved from the repo DID. This two-phase shape
+// prevents unrelated global events from forcing verifier traffic and prevents
+// a forged sibling record from shadowing the real repository.
 func (p *pipelineService) managedRepo(ctx context.Context, repoDID string) (*RepoRef, error) {
 	managed, err := p.store.HasManagedRepo(
 		ctx, repoDID, p.cfg.Hostname, p.cfg.OwnerDID,
@@ -713,6 +803,10 @@ func (p *pipelineService) managedRepo(ctx context.Context, repoDID string) (*Rep
 	)
 }
 
+// verifiedRepo resolves canonical repository identity with a five-minute cache.
+// Verification gets one short-delay retry because eventconsumer advances its
+// cursor even when processing returns an error; retrying here avoids losing a
+// push on a single transient resolver failure.
 func (p *pipelineService) verifiedRepo(ctx context.Context, value string) (*RepoRef, error) {
 	p.verifiedMu.Lock()
 	cached, ok := p.verifiedRepos[value]
@@ -753,12 +847,18 @@ func (p *pipelineService) verifiedRepo(ctx context.Context, value string) (*Repo
 	return &copy, nil
 }
 
+// invalidateRepoVerificationCache drops canonical identities after any mirrored
+// repo mutation. The cache is small and repo updates are rare, so clearing it is
+// simpler and safer than trying to infer which DID an update/delete displaced.
 func (p *pipelineService) invalidateRepoVerificationCache() {
 	p.verifiedMu.Lock()
 	clear(p.verifiedRepos)
 	p.verifiedMu.Unlock()
 }
 
+// pipelineTriggerRepo converts the persisted repository identity into the
+// deprecated trigger shape still used internally by Tangled's compiler and
+// provider environment helpers.
 func pipelineTriggerRepo(repo *RepoRef, defaultBranch string) *tangled.Pipeline_TriggerRepo {
 	rkey := repo.Rkey
 	repoDID := repo.RepoDID
@@ -771,6 +871,8 @@ func pipelineTriggerRepo(repo *RepoRef, defaultBranch string) *tangled.Pipeline_
 	}
 }
 
+// pointerValue collapses an optional lexicon string to the store/compiler's
+// empty-string convention.
 func pointerValue(value *string) string {
 	if value == nil {
 		return ""
@@ -778,6 +880,7 @@ func pointerValue(value *string) string {
 	return *value
 }
 
+// skipsCI recognizes both push-option spellings supported by current knots.
 func skipsCI(options []string) bool {
 	for _, option := range options {
 		if option == "skip-ci" || option == "ci-skip" {

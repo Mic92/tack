@@ -26,7 +26,9 @@ type config struct {
 	OwnerDID     string
 	JetstreamURL string
 	DBPath       string
-	RepoDir      string
+	// RepoDir holds sparse, mutable workflow checkouts. It is separate from
+	// provider workspaces: Tack reads configuration here but never executes it.
+	RepoDir string
 	// Dev flips the knot event-stream scheme from wss:// to ws://.
 	// Useful when running against a local knot during development.
 	Dev bool
@@ -61,6 +63,8 @@ type config struct {
 	SourcehutInstance string
 }
 
+// loadConfig resolves environment defaults, applies flag overrides, and rejects
+// partial provider configurations before any network or database work begins.
 func loadConfig() (config, error) {
 	dbPath := envOr("TACK_DB_PATH", "tack.db")
 	cfg := config{

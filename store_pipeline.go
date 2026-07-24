@@ -33,6 +33,9 @@ func (s *store) QueryPipelines(
 		limit = 250
 	}
 
+	// Build one parameterized base query, then wrap it for the commit-specific
+	// deduplication contract below. RepoDid is preferred, with Did retained only
+	// for pipeline records created before stable repository DIDs were universal.
 	query := `
 		SELECT rkey, event_json, created
 		FROM events
@@ -44,6 +47,8 @@ func (s *store) QueryPipelines(
 	args := []any{tangled.PipelineNSID, repoDID}
 
 	if len(commits) > 0 {
+		// Commit identity lives in a different union branch for each trigger kind.
+		// COALESCE gives filtering and later partitioning one common SQL key.
 		query += ` AND COALESCE(
 			json_extract(event_json, '$.triggerMetadata.push.newSha'),
 			json_extract(event_json, '$.triggerMetadata.pullRequest.sourceSha'),
@@ -107,6 +112,9 @@ func (s *store) QueryPipelines(
 		return nil, "", 0, fmt.Errorf("query pipelines: %w", err)
 	}
 	defer rows.Close()
+	// Buffer raw rows before status projection. store deliberately permits only
+	// one SQLite connection; querying statuses while rows is open would deadlock
+	// waiting for that same connection.
 	type storedPipeline struct {
 		rkey    string
 		raw     tangled.Pipeline
@@ -172,6 +180,8 @@ func (s *store) HasPullPipeline(ctx context.Context, pullURI, sourceSHA string) 
 	return count > 0, nil
 }
 
+// sqlPlaceholders returns a comma-separated placeholder list for a non-empty
+// filter. Callers append values separately, so user input never enters SQL text.
 func sqlPlaceholders(count int) string {
 	return strings.TrimSuffix(strings.Repeat("?,", count), ",")
 }
@@ -206,6 +216,10 @@ func (s *store) GetRawPipeline(ctx context.Context, rkey string) (*tangled.Pipel
 	return &raw, created, nil
 }
 
+// mapPipeline projects the internal sh.tangled.pipeline record and retained
+// workflow statuses into the spindle-owned sh.tangled.ci.pipeline response.
+// Keeping the legacy record internally avoids duplicating Tangled's compiler
+// and provider trigger types at write time.
 func (s *store) mapPipeline(
 	ctx context.Context,
 	rkey string,
@@ -256,6 +270,10 @@ func (s *store) mapPipeline(
 	return result, nil
 }
 
+// ciTrigger converts legacy Pipeline_TriggerMetadata into the public CI trigger
+// union and returns the commit SHA used by CiPipeline.Commit. Unknown or
+// structurally incomplete trigger variants produce a nil trigger and empty SHA
+// rather than inventing metadata.
 func ciTrigger(metadata *tangled.Pipeline_TriggerMetadata) (*tangled.CiPipeline_Trigger, string) {
 	trigger := &tangled.CiPipeline_Trigger{}
 	switch workflow.TriggerKind(metadata.Kind) {
@@ -300,6 +318,10 @@ func ciTrigger(metadata *tangled.Pipeline_TriggerMetadata) (*tangled.CiPipeline_
 	return nil, ""
 }
 
+// workflowStatus returns the latest status/error plus the first running and
+// last terminal timestamps for one workflow. Missing status rows mean pending:
+// a pipeline is persisted before asynchronous provider setup publishes its
+// first explicit status.
 func (s *store) workflowStatus(
 	ctx context.Context,
 	knot, pipelineRkey, workflowName string,
@@ -311,6 +333,8 @@ func (s *store) workflowStatus(
 	pipelineURI := pipelineATURI(knot, pipelineRkey)
 
 	var rawJSON []byte
+	// Status is an append-only event stream. Ordering by the monotonic created
+	// value gives the current state without maintaining a second mutable table.
 	err := s.db.QueryRowContext(ctx, `
 		SELECT event_json
 		FROM events
@@ -332,6 +356,8 @@ func (s *store) workflowStatus(
 		return "", nil, nil, nil, err
 	}
 
+	// Timestamps come from record payloads, not insertion time: provider webhook
+	// delivery may lag the actual transition we want to display.
 	var started, finished sql.NullString
 	err = s.db.QueryRowContext(ctx, `
 		SELECT
@@ -355,6 +381,7 @@ func (s *store) workflowStatus(
 	return status, nullStringPointer(started), nullStringPointer(finished), statusErr, nil
 }
 
+// nullStringPointer converts SQLite aggregate NULLs to optional lexicon fields.
 func nullStringPointer(value sql.NullString) *string {
 	if !value.Valid {
 		return nil

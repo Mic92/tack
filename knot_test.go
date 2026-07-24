@@ -18,6 +18,8 @@ import (
 	"tangled.org/core/repoverify"
 )
 
+// newTestKnotConsumer replaces network verification and workflow loading while
+// retaining the real authorization, persistence, and dispatch paths.
 func newTestKnotConsumer(st *store, provider Provider) *knotConsumer {
 	cfg := config{
 		Hostname: "spindle.example",
@@ -39,6 +41,7 @@ func newTestKnotConsumer(st *store, provider Provider) *knotConsumer {
 	return &knotConsumer{log: slog.Default(), pipelines: service}
 }
 
+// testRepoVerifier treats the mirrored test row as the canonical DID result.
 func testRepoVerifier(st *store) repoverify.Verifier {
 	return func(ctx context.Context, repoDID repoident.RepoDid) (repoverify.Result, error) {
 		repo, err := st.RepoByDID(ctx, repoDID.String())
@@ -61,6 +64,7 @@ func testRepoVerifier(st *store) repoverify.Verifier {
 	}
 }
 
+// refUpdateMessage constructs the current knot-side push trigger envelope.
 func refUpdateMessage(t *testing.T, repoDID string) eventstream.Event {
 	t.Helper()
 	record := tangled.GitRefUpdate{
@@ -77,10 +81,13 @@ func refUpdateMessage(t *testing.T, repoDID string) eventstream.Event {
 	return eventstream.Event{Rkey: "ref-1", Nsid: tangled.GitRefUpdateNSID, EventJson: body}
 }
 
+// knotSource is the authoritative source expected by the seeded repo records.
 func knotSource() eventconsumer.Source {
 	return eventconsumer.Source{Kind: eventconsumer.KindKnot, Host: "knot.example"}
 }
 
+// TestKnotProcessAuthorized proves an owner-managed repo creates and dispatches
+// one spindle-owned pipeline.
 func TestKnotProcessAuthorized(t *testing.T) {
 	st := newTestStore(t)
 	ctx := context.Background()
@@ -115,6 +122,8 @@ func TestKnotProcessAuthorized(t *testing.T) {
 	}
 }
 
+// TestKnotProcessRejectsUnknownRepo ensures global knot traffic cannot force
+// verification or provider work for a repo Tack does not serve.
 func TestKnotProcessRejectsUnknownRepo(t *testing.T) {
 	st := newTestStore(t)
 	stub := &stubProvider{}
@@ -129,6 +138,8 @@ func TestKnotProcessRejectsUnknownRepo(t *testing.T) {
 	}
 }
 
+// TestKnotProcessRejectsNonMember pins spindle membership as a live gate and
+// verifies an owner-issued grant takes effect without restarting the consumer.
 func TestKnotProcessRejectsNonMember(t *testing.T) {
 	st := newTestStore(t)
 	ctx := context.Background()
@@ -173,6 +184,8 @@ func TestKnotProcessRejectsNonMember(t *testing.T) {
 	}
 }
 
+// TestKnotProcessHonorsSkipCI confirms knot push options suppress compilation
+// before any provider work is created.
 func TestKnotProcessHonorsSkipCI(t *testing.T) {
 	st := newTestStore(t)
 	ctx := context.Background()
@@ -205,6 +218,8 @@ func TestKnotProcessHonorsSkipCI(t *testing.T) {
 	}
 }
 
+// TestKnotProcessCollaboratorUpdate covers authoritative knot ACL add/remove
+// events and their effect on manual-trigger authorization.
 func TestKnotProcessCollaboratorUpdate(t *testing.T) {
 	st := newTestStore(t)
 	ctx := context.Background()

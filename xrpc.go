@@ -22,8 +22,13 @@ import (
 	"tangled.org/core/xrpc/serviceauth"
 )
 
+// wsWriteWait bounds every data/control write so a peer that stops reading
+// cannot pin a subscription goroutine forever in the kernel send buffer.
 const wsWriteWait = 10 * time.Second
 
+// registerCiRoutes installs the current spindle-owned CI API. Query and log
+// endpoints are public, matching upstream; triggerPipeline is service-auth
+// protected because it can create externally billed work.
 func registerCiRoutes(
 	mux *http.ServeMux,
 	cfg config,
@@ -56,6 +61,8 @@ func registerCiRoutes(
 	)
 }
 
+// ciQueryPipelinesHandler validates the lexicon query parameters and projects
+// retained internal pipeline/status events into sh.tangled.ci.pipeline values.
 func ciQueryPipelinesHandler(logger *slog.Logger, st *store) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		repo := r.URL.Query().Get("repo")
@@ -101,6 +108,9 @@ func ciQueryPipelinesHandler(logger *slog.Logger, st *store) http.HandlerFunc {
 	}
 }
 
+// ciGetPipelineHandler returns one spindle-local pipeline by TID. A TID is
+// validated before touching SQLite so malformed identifiers get the lexicon's
+// InvalidRequest response rather than an ambiguous not-found.
 func ciGetPipelineHandler(logger *slog.Logger, st *store) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		pipeline := r.URL.Query().Get("pipeline")
@@ -122,6 +132,10 @@ func ciGetPipelineHandler(logger *slog.Logger, st *store) http.HandlerFunc {
 	}
 }
 
+// ciTriggerPipelineHandler decodes the authenticated actor inserted by
+// serviceauth and delegates all repository authorization/trigger conversion to
+// pipelineService. Bodies are capped because the public lexicon contains no
+// blobs and legitimate requests are tiny.
 func ciTriggerPipelineHandler(
 	logger *slog.Logger,
 	pipelines *pipelineService,
@@ -148,10 +162,17 @@ func ciTriggerPipelineHandler(
 	})
 }
 
+// workflowLogStream is the validated unit fanned into one log subscription.
+// It intentionally carries only a name; each worker resolves fresh provider
+// snapshots so subscriptions can begin before asynchronous run mappings exist.
 type workflowLogStream struct {
 	workflow string
 }
 
+// ciSubscribePipelineLogsHandler implements Tangled's binary DRISL-CBOR log
+// subscription. It validates every requested workflow before upgrading, runs
+// one provider follower per workflow, and remains the sole WebSocket writer so
+// Gorilla's one-concurrent-writer rule is never violated.
 func ciSubscribePipelineLogsHandler(
 	logger *slog.Logger,
 	st *store,
@@ -175,6 +196,8 @@ func ciSubscribePipelineLogsHandler(
 			return
 		}
 
+		// Build the authoritative workflow set from the immutable pipeline record;
+		// provider mappings are intentionally not consulted until after upgrade.
 		available := make(map[string]struct{}, len(raw.Workflows))
 		for _, wf := range raw.Workflows {
 			if wf != nil && wf.Name != "" {
@@ -183,6 +206,8 @@ func ciSubscribePipelineLogsHandler(
 		}
 		workflows := r.URL.Query()["workflows"]
 		if len(workflows) == 0 {
+			// Omitted workflows means all, preserving the order captured at compile
+			// time so interleaved streams are deterministic at startup.
 			workflows = make([]string, 0, len(available))
 			for _, wf := range raw.Workflows {
 				if wf != nil && wf.Name != "" {
@@ -205,6 +230,8 @@ func ciSubscribePipelineLogsHandler(
 			return
 		}
 
+		// Derive one cancellation domain for provider followers, the disconnect
+		// reader, and the writer loop. Any side ending tears down the others.
 		ctx, cancel := context.WithCancel(r.Context())
 		defer cancel()
 		streams := make([]workflowLogStream, 0, len(workflows))
@@ -216,6 +243,8 @@ func ciSubscribePipelineLogsHandler(
 			streams = append(streams, workflowLogStream{workflow: name})
 		}
 
+		// Upgrade only after all parameter and pipeline checks. Before this point we
+		// can still return useful XRPC HTTP errors to the caller.
 		conn, err := upgrader.Upgrade(w, r, nil)
 		if err != nil {
 			logger.Error("pipeline logs websocket upgrade", "err", err)
@@ -230,6 +259,8 @@ func ciSubscribePipelineLogsHandler(
 			conn.Close()
 		}()
 
+		// We do not expect application messages from the client. A blocking read is
+		// solely the prompt disconnect detector for provider polling goroutines.
 		go func() {
 			for {
 				if _, _, err := conn.NextReader(); err != nil {
@@ -239,6 +270,8 @@ func ciSubscribePipelineLogsHandler(
 			}
 		}()
 
+		// Followers may block briefly on provider APIs. A bounded fan-in buffer lets
+		// another workflow continue without allowing an unbounded slow-client queue.
 		events := make(chan *tangled.CiSubscribePipelineLogs_Event, 128)
 		var wg sync.WaitGroup
 		for _, stream := range streams {
@@ -257,6 +290,8 @@ func ciSubscribePipelineLogsHandler(
 			close(events)
 		}()
 
+		// This loop is the only writer: both data frames and keep-alive control
+		// frames pass through it, avoiding concurrent writes to conn.
 		ticker := time.NewTicker(30 * time.Second)
 		defer ticker.Stop()
 		for {
@@ -311,6 +346,10 @@ func followProviderLogs(
 	)
 }
 
+// followProviderLogsWithInterval contains the polling implementation with an
+// injectable steady-state interval for tests. Providers expose snapshots, not
+// append-only cursors, so it tracks starts and data counts independently per
+// step and withholds end controls until the workflow itself is terminal.
 func followProviderLogsWithInterval(
 	ctx context.Context,
 	logger *slog.Logger,
@@ -320,6 +359,9 @@ func followProviderLogsWithInterval(
 	out chan<- *tangled.CiSubscribePipelineLogs_Event,
 	pollInterval time.Duration,
 ) {
+	// A snapshot repeats all prior frames. Step-local counters are necessary:
+	// output growing in step 0 inserts frames before step 1 and makes a single
+	// global frame offset skip or duplicate data.
 	started := make(map[int]bool)
 	emittedData := make(map[int]int)
 	terminalRetries := 0
@@ -348,6 +390,9 @@ func followProviderLogsWithInterval(
 					}
 					if line.Kind == LogKindControl {
 						if line.StepStatus == StepStatusEnd {
+							// Snapshot providers may synthesize an end marker even while the
+							// external job is still running. Delay it until retained status is
+							// terminal or later output would appear after a closed UI block.
 							endLines = append(endLines, line)
 							continue
 						}
@@ -397,6 +442,9 @@ func followProviderLogsWithInterval(
 			)
 		}
 		if isTerminalPipelineStatus(status) {
+			// A terminal status usually races the provider's final log availability.
+			// Give transient API failures three bounded retries before ending the
+			// subscription; ErrLogsNotFound is a legitimate empty-log result.
 			if err != nil && !errors.Is(err, ErrLogsNotFound) && terminalRetries < 3 {
 				terminalRetries++
 				delay := logPollBackoff(3*time.Second, terminalRetries, 15*time.Second)
@@ -428,6 +476,9 @@ func followProviderLogsWithInterval(
 	}
 }
 
+// logPollBackoff returns capped exponential backoff where failures=1 means the
+// base delay. Provider rate limits use the 15/30/60-second sequence; terminal
+// final-log retries use a shorter 3/6/12-second sequence.
 func logPollBackoff(base time.Duration, failures int, maximum time.Duration) time.Duration {
 	delay := base
 	for range failures - 1 {
@@ -439,6 +490,7 @@ func logPollBackoff(base time.Duration, failures int, maximum time.Duration) tim
 	return min(delay, maximum)
 }
 
+// isTerminalPipelineStatus mirrors Tangled's four workflow finish states.
 func isTerminalPipelineStatus(status string) bool {
 	switch status {
 	case "success", "failed", "timeout", "cancelled":
@@ -448,6 +500,9 @@ func isTerminalPipelineStatus(status string) bool {
 	}
 }
 
+// ciLogEvent converts the provider-neutral LogLine into one branch of the
+// subscription union. It fills protocol defaults for old providers that omit
+// timestamps, stream names, or step kinds.
 func ciLogEvent(workflow string, line LogLine) *tangled.CiSubscribePipelineLogs_Event {
 	timestamp := line.Time
 	if timestamp.IsZero() {
@@ -486,6 +541,8 @@ func ciLogEvent(workflow string, line LogLine) *tangled.CiSubscribePipelineLogs_
 	}
 }
 
+// optionalString preserves the lexicon distinction between absent optional
+// metadata and a meaningful non-empty value.
 func optionalString(value string) *string {
 	if value == "" {
 		return nil
@@ -493,12 +550,15 @@ func optionalString(value string) *string {
 	return &value
 }
 
+// writeJSON writes the common JSON response envelope used by non-subscription
+// XRPC methods.
 func writeJSON(w http.ResponseWriter, status int, value any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(value)
 }
 
+// writeXRPCError emits the {error,message} shape required by ATProto XRPC.
 func writeXRPCError(w http.ResponseWriter, status int, name, message string) {
 	writeJSON(w, status, map[string]string{"error": name, "message": message})
 }
