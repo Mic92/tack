@@ -110,15 +110,16 @@ func newPipelineService(
 	provider Provider,
 ) *pipelineService {
 	resolver := idresolver.DefaultResolver(identity.DefaultPLCURL)
+	httpClient := newPipelineHTTPClient(cfg.Dev)
 	p := &pipelineService{
 		rootCtx:       rootCtx,
-		httpClient:    newPipelineHTTPClient(cfg.Dev),
+		httpClient:    httpClient,
 		cfg:           cfg,
 		store:         st,
 		broker:        br,
 		provider:      provider,
 		directory:     identity.DefaultDirectory(),
-		verify:        repoverify.New(resolver, cfg.Dev),
+		verify:        newRepoVerifier(resolver.Directory(), httpClient, cfg.Dev),
 		repoLocks:     make(map[string]*sync.Mutex),
 		verifiedRepos: make(map[string]verifiedRepoCache),
 	}
