@@ -84,13 +84,15 @@ func (p *delayedLogsProvider) Logs(
 	return lines, nil
 }
 
-// TestFollowProviderLogsWaitsForProviderMapping confirms ErrLogsNotFound is
-// retried while status is non-terminal and does not prematurely close the
-// subscription.
+// TestFollowProviderLogsWaitsForProviderMapping pins that ErrLogsNotFound is retried while the
+// workflow status is not terminal, instead of closing the log subscription. Providers record the
+// mapping from a pipeline to its external run asynchronously after Spawn, so the first lookup can
+// find no logs yet. The test also checks that the line reaches the caller with its kind and
+// content intact.
 func TestFollowProviderLogsWaitsForProviderMapping(t *testing.T) {
 	st := newTestStore(t)
 	provider := &delayedLogsProvider{broker: newBroker(st)}
-	events := make(chan *tangled.CiSubscribePipelineLogs_Event, 1)
+	events := make(chan workflowLogLine, 1)
 	followProviderLogsWithInterval(
 		context.Background(), slog.Default(), st, provider,
 		"knot.example", "3m5x7k2abcde2", "ci.yml", events, 5*time.Millisecond,
@@ -103,7 +105,7 @@ func TestFollowProviderLogsWaitsForProviderMapping(t *testing.T) {
 	}
 	select {
 	case event := <-events:
-		if event.Data == nil || event.Data.Content != "ready\n" {
+		if event.line.Kind != LogKindData || event.line.Content != "ready\n" {
 			t.Fatalf("event = %+v", event)
 		}
 	default:
@@ -266,5 +268,33 @@ func TestPullRecordCreatesPipeline(t *testing.T) {
 	if pipeline.TriggerMetadata == nil || pipeline.TriggerMetadata.PullRequest == nil ||
 		pipeline.TriggerMetadata.PullRequest.SourceBranch != "feature" {
 		t.Fatalf("pull trigger = %+v", pipeline.TriggerMetadata)
+	}
+}
+
+// TestOrgLogEventCarriesStepOutcome pins how orgLogEvent builds current (Tangled v1.20) log
+// frames. End markers carry the step outcome because the Tangled web app uses it to mark the failed
+// step. When no step reports an outcome and the workflow ends without succeeding, the web app marks
+// the last step as failed instead. Start markers never carry an outcome, even when the provider
+// set one. Data lines with an unknown stream fall back to stdout, the same default the legacy
+// frames use.
+func TestOrgLogEventCarriesStepOutcome(t *testing.T) {
+	end := LogLine{
+		Kind: LogKindControl, StepStatus: StepStatusEnd, StepOutcome: StepOutcomeFailed,
+		Content: "test", StepId: 1, Time: time.Date(2026, 10, 30, 10, 0, 0, 0, time.UTC),
+	}
+	event := orgLogEvent("ci.yml", end)
+	if event.Control == nil || pointerValue(event.Control.Outcome) != "failed" ||
+		pointerValue(event.Control.Status) != "end" || event.Control.Time != "2026-10-30T10:00:00Z" {
+		t.Fatalf("end marker = %+v", event.Control)
+	}
+	// start keeps the failed outcome, so a nil Outcome proves orgLogEvent drops it.
+	start := end
+	start.StepStatus = StepStatusStart
+	if event := orgLogEvent("ci.yml", start); event.Control.Outcome != nil {
+		t.Fatalf("start marker carries outcome %q", *event.Control.Outcome)
+	}
+	data := orgLogEvent("ci.yml", LogLine{Kind: LogKindData, Content: "x\n", Stream: "bogus"})
+	if data.Data == nil || data.Data.Stream != "stdout" {
+		t.Fatalf("data = %+v", data.Data)
 	}
 }

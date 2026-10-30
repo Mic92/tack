@@ -7,7 +7,6 @@ import (
 	"context"
 	"encoding/json"
 	"log/slog"
-	"net/url"
 	"testing"
 
 	"tangled.org/core/api/tangled"
@@ -15,7 +14,6 @@ import (
 	"tangled.org/core/eventstream"
 	knotdb "tangled.org/core/knotserver/db"
 	"tangled.org/core/repoident"
-	"tangled.org/core/repoverify"
 )
 
 // newTestKnotConsumer replaces network verification and workflow loading while
@@ -41,24 +39,25 @@ func newTestKnotConsumer(st *store, provider Provider) *knotConsumer {
 	return &knotConsumer{log: slog.Default(), pipelines: service}
 }
 
-// testRepoVerifier treats the mirrored test row as the canonical DID result.
-func testRepoVerifier(st *store) repoverify.Verifier {
-	return func(ctx context.Context, repoDID repoident.RepoDid) (repoverify.Result, error) {
+// testRepoVerifier answers from the mirrored store row instead of resolving the DID and asking a
+// knot. The result never sets RepoRef.FromManifest, so it models a Go knot answering
+// describeRepo rather than a knot2 repo manifest. A DID with no row, such as a fork source that is
+// not assigned to this spindle, still resolves: it gets owner did:plc:owner on knot.example.
+func testRepoVerifier(st *store) repoVerifier {
+	return func(ctx context.Context, repoDID repoident.RepoDid) (*RepoRef, error) {
 		repo, err := st.RepoByDID(ctx, repoDID.String())
 		if err != nil {
-			return repoverify.Result{}, err
+			return nil, err
 		}
 		if repo == nil {
-			knot, _ := url.Parse("https://knot.example")
-			return repoverify.Result{
-				RepoDid: repoDID, OwnerDid: repoident.OwnerDid("did:plc:owner"), KnotURL: knot,
+			return &RepoRef{
+				RepoDID: repoDID.String(), OwnerDID: "did:plc:owner", Knot: "knot.example",
 			}, nil
 		}
-		knot, _ := url.Parse("https://" + repo.Knot)
-		return repoverify.Result{
-			RepoDid:  repoDID,
-			OwnerDid: repoident.OwnerDid(repo.OwnerDID),
-			KnotURL:  knot,
+		return &RepoRef{
+			RepoDID:  repoDID.String(),
+			OwnerDID: repo.OwnerDID,
+			Knot:     repo.Knot,
 			Rkey:     repo.Rkey,
 		}, nil
 	}
@@ -269,5 +268,37 @@ func TestKnotProcessCollaboratorUpdate(t *testing.T) {
 	}
 	if authorized {
 		t.Fatal("removed knot collaborator remains authorized")
+	}
+}
+
+// TestKnotProcessIgnoresDefaultBranchChanges pins that the sh.tangled.git.refUpdate a Go knot
+// emits when its sh.tangled.repo.setDefaultBranch XRPC changes the default branch is dropped
+// without error. That event carries the repo DID but an empty ref and empty SHAs. Treating it as
+// a push used to fail when Tack loaded workflows at the empty revision, and knotConsumer.process
+// hands every processRefUpdate error to retryPipelineEvent, so each default-branch change cost
+// five pointless retries and a string of warnings.
+func TestKnotProcessIgnoresDefaultBranchChanges(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+	if err := st.UpsertRepo(ctx, "did:plc:owner", "rk1", "knot.example", "myrepo",
+		"spindle.example", "did:plc:repo", "t"); err != nil {
+		t.Fatal(err)
+	}
+	stub := &stubProvider{}
+	kc := newTestKnotConsumer(st, stub)
+	body, err := json.Marshal(tangled.GitRefUpdate{LexiconTypeID: tangled.GitRefUpdateNSID, Repo: "did:plc:repo"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// process logs and retries errors instead of returning them, so call processRefUpdate
+	// directly to assert it returns nil. Then go through process to cover the decode path.
+	if err := kc.pipelines.processRefUpdate(ctx, knotSource(), &tangled.GitRefUpdate{Repo: "did:plc:repo"}); err != nil {
+		t.Fatalf("processRefUpdate: %v", err)
+	}
+	if err := kc.process(ctx, knotSource(), eventstream.Event{Nsid: tangled.GitRefUpdateNSID, EventJson: body}); err != nil {
+		t.Fatalf("process: %v", err)
+	}
+	if got := stub.names(); len(got) != 0 {
+		t.Fatalf("spawned %v; want nothing", got)
 	}
 }

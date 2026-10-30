@@ -370,9 +370,10 @@ func (p *buildkiteProvider) buildCreateRequest(
 // list, then drain each job's plain-text log into the channel as one
 // LogLine per output line.
 //
-// Per-job control frames bracket each job so the appview's renderer
-// has start/end markers to lay out timing — same shape as the fake
-// provider and the upstream spindle.
+// Start and end control frames bracket each job, the same shape the fake provider and the
+// upstream spindle emit. The Tangled web app uses them to lay out step timing. Each end frame
+// also carries the job's outcome (see buildkiteJobOutcome) so the web app can mark the step
+// that failed.
 //
 // This is a snapshot read, not a tail — finished or in-progress, we
 // fetch what's there and close. Live tailing would require Buildkite
@@ -479,11 +480,12 @@ func (p *buildkiteProvider) Logs(
 			}
 
 			if !sendLine(ctx, out, LogLine{
-				Kind:       LogKindControl,
-				Time:       time.Now(),
-				Content:    name,
-				StepId:     stepID,
-				StepStatus: StepStatusEnd,
+				Kind:        LogKindControl,
+				Time:        time.Now(),
+				Content:     name,
+				StepId:      stepID,
+				StepStatus:  StepStatusEnd,
+				StepOutcome: buildkiteJobOutcome(job.State),
 			}) {
 				return
 			}
@@ -858,5 +860,24 @@ func sendLine(ctx context.Context, out chan<- LogLine, line LogLine) bool {
 		return false
 	case out <- line:
 		return true
+	}
+}
+
+// buildkiteJobOutcome maps a Buildkite job state to the outcome Logs puts on that job's step end
+// marker (see LogLine.StepOutcome). Only the terminal states listed here produce an outcome: "passed" is a success, and
+// "failed", "timed_out", and "canceled" are failures. Every other state (still running,
+// skipped, blocked, broken, and so on) returns the empty string so the end marker carries no
+// outcome. The upstream spindle never sends an empty outcome: its engine writes an end marker
+// only after a step returns, and always records models.OutcomeOf(err). Buildkite jobs can end
+// without running (skipped, broken) or still be running when Logs takes its snapshot, so Tack
+// leaves those empty and does not claim a result it did not observe.
+func buildkiteJobOutcome(state string) string {
+	switch state {
+	case "passed":
+		return StepOutcomeSuccess
+	case "failed", "timed_out", "canceled":
+		return StepOutcomeFailed
+	default:
+		return ""
 	}
 }

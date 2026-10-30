@@ -1,7 +1,8 @@
 package main
 
-// XRPC endpoints introduced when Tangled moved pipeline state ownership from
-// appview to each spindle.
+// XRPC endpoints for the CI API each spindle serves: the legacy sh.tangled.ci.* methods and the
+// current org.tangled.* methods. Tangled moved pipeline state out of the legacy appview and into
+// spindles, so clients query, stream, and act on pipelines through Tack directly.
 
 import (
 	"context"
@@ -9,34 +10,54 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"strconv"
 	"sync"
 	"time"
 
-	"github.com/bluesky-social/indigo/atproto/identity"
 	"github.com/bluesky-social/indigo/atproto/syntax"
 	"github.com/gorilla/websocket"
 	"tangled.org/core/api/tangled"
-	"tangled.org/core/xrpc/serviceauth"
+
+	"go.mitchellh.com/tack/internal/orgtangled"
 )
 
 // wsWriteWait bounds every data/control write so a peer that stops reading
 // cannot pin a subscription goroutine forever in the kernel send buffer.
 const wsWriteWait = 10 * time.Second
 
-// registerCiRoutes installs the current spindle-owned CI API. Query and log
-// endpoints are public, matching upstream; triggerPipeline is service-auth
-// protected because it can create externally billed work.
-func registerCiRoutes(
+// registerCIRoutes installs the CI API for both protocol generations: the legacy
+// sh.tangled.ci.* methods and the current org.tangled.* methods. Queries and log
+// subscriptions are public, as they are upstream, because pipeline state is not secret.
+// Procedures that start or act on builds require service auth (the signed JWT one
+// atproto service sends another to prove who is calling) because they can create
+// externally billed work. cancelPipeline is the exception: it always fails with
+// MethodNotImplemented, so there is nothing to protect.
+//
+// The legacy routes remain because the legacy appview still calls them. The v1.20
+// upstream spindle answers 404 for them, but serving both generations costs nothing
+// and keeps older Tangled deployments working.
+//
+// One WebSocket upgrader is shared by both log routes. Its CheckOrigin comes from the
+// CORS policy because the Tangled web app opens the log WebSocket from the browser,
+// and CORS headers do not restrict upgrades.
+func registerCIRoutes(
 	mux *http.ServeMux,
-	cfg config,
 	logger *slog.Logger,
 	st *store,
 	provider Provider,
 	pipelines *pipelineService,
+	auth *serviceAuth,
+	cors corsPolicy,
 ) {
+	upgrader := websocket.Upgrader{
+		ReadBufferSize:  10_000,
+		WriteBufferSize: 10_000,
+		CheckOrigin:     cors.CheckOrigin,
+	}
+
 	mux.HandleFunc(
 		"GET /xrpc/"+tangled.CiQueryPipelinesNSID,
 		ciQueryPipelinesHandler(logger, st),
@@ -47,17 +68,40 @@ func registerCiRoutes(
 	)
 	mux.HandleFunc(
 		"GET /xrpc/"+tangled.CiSubscribePipelineLogsNSID,
-		ciSubscribePipelineLogsHandler(logger, st, provider),
-	)
-
-	auth := serviceauth.NewServiceAuth(
-		logger,
-		identity.DefaultDirectory(),
-		serviceauth.DidWeb(cfg.Hostname).String(),
+		ciSubscribePipelineLogsHandler(logger, st, provider, upgrader, false),
 	)
 	mux.Handle(
 		"POST /xrpc/"+tangled.CiTriggerPipelineNSID,
-		auth.VerifyServiceAuth(ciTriggerPipelineHandler(logger, pipelines)),
+		auth.Middleware(ciTriggerPipelineHandler(logger, pipelines)),
+	)
+
+	mux.HandleFunc(
+		"GET /xrpc/"+orgtangled.NSIDQueryPipelines,
+		orgQueryPipelinesHandler(logger, pipelines),
+	)
+	mux.HandleFunc(
+		"GET /xrpc/"+orgtangled.NSIDGetPipeline,
+		orgGetPipelineHandler(logger, st),
+	)
+	mux.HandleFunc(
+		"GET /xrpc/"+orgtangled.NSIDSubscribePipelineLogs,
+		ciSubscribePipelineLogsHandler(logger, st, provider, upgrader, true),
+	)
+	mux.Handle(
+		"POST /xrpc/"+orgtangled.NSIDRetryPipeline,
+		auth.Middleware(orgRetryPipelineHandler(logger, pipelines)),
+	)
+	mux.Handle(
+		"POST /xrpc/"+orgtangled.NSIDApprovePipeline,
+		auth.Middleware(orgApprovePipelineHandler(logger, pipelines)),
+	)
+	mux.HandleFunc(
+		"POST /xrpc/"+orgtangled.NSIDCancelPipeline,
+		orgCancelPipelineHandler(),
+	)
+	mux.Handle(
+		"POST /xrpc/"+orgtangled.NSIDNotifyEvent,
+		auth.Middleware(notifyEventHandler(logger, pipelines, newReplayGuard())),
 	)
 }
 
@@ -132,20 +176,22 @@ func ciGetPipelineHandler(logger *slog.Logger, st *store) http.HandlerFunc {
 	}
 }
 
-// ciTriggerPipelineHandler decodes the authenticated actor inserted by
-// serviceauth and delegates all repository authorization/trigger conversion to
-// pipelineService. Bodies are capped because the public lexicon contains no
-// blobs and legitimate requests are tiny.
+// ciTriggerPipelineHandler implements the legacy sh.tangled.ci.triggerPipeline. It
+// reads the caller that [serviceAuth.Middleware] verified and attached to the request
+// context, and leaves repository authorization and trigger conversion to
+// pipelineService. Bodies are capped at 1 MiB because the lexicon has no blobs and
+// legitimate requests are tiny.
 func ciTriggerPipelineHandler(
 	logger *slog.Logger,
 	pipelines *pipelineService,
 ) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		actor, ok := r.Context().Value(serviceauth.ActorDid).(syntax.DID)
+		principal, ok := principalFrom(r.Context())
 		if !ok {
 			writeXRPCError(w, http.StatusForbidden, "AuthRequired", "actor DID is missing")
 			return
 		}
+		actor := principal.Issuer
 		var input tangled.CiTriggerPipeline_Input
 		decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20))
 		if err := decoder.Decode(&input); err != nil {
@@ -169,25 +215,50 @@ type workflowLogStream struct {
 	workflow string
 }
 
-// ciSubscribePipelineLogsHandler implements Tangled's binary DRISL-CBOR log
-// subscription. It validates every requested workflow before upgrading, runs
-// one provider follower per workflow, and remains the sole WebSocket writer so
-// Gorilla's one-concurrent-writer rule is never violated.
+// maxLogWorkflows caps how many workflows one log subscription may follow. Each one
+// starts a provider polling goroutine, so the cap bounds the work a single public
+// request can cause. The value matches the upstream spindle.
+const maxLogWorkflows = 100
+
+// ciSubscribePipelineLogsHandler implements Tangled's log subscription for both API generations:
+// a WebSocket that streams binary CBOR frames (each frame is an atproto event-stream header
+// followed by a message body). The two use the same framing and field names, and differ only in
+// the step outcome that current end markers carry (see logFrame). The handler validates every
+// requested workflow before upgrading, runs one provider follower per workflow, and remains the
+// sole WebSocket writer so Gorilla's one-concurrent-writer rule is never violated.
+//
+// scoped selects the current org.tangled.ci.subscribePipelineLogs contract. The
+// caller must pass a repo DID, the pipeline is a record key rather than a TID, and a
+// missing pipeline is reported as PipelineNotFound, the error name the lexicon
+// declares. A pipeline that belongs to a different repository is also reported as
+// not found, matching orgGetPipelineHandler, so a request cannot read another
+// repository's logs by pairing its own repo with a foreign pipeline key.
 func ciSubscribePipelineLogsHandler(
 	logger *slog.Logger,
 	st *store,
 	provider Provider,
+	upgrader websocket.Upgrader,
+	scoped bool,
 ) http.HandlerFunc {
-	upgrader := websocket.Upgrader{ReadBufferSize: 10_000, WriteBufferSize: 10_000}
 	return func(w http.ResponseWriter, r *http.Request) {
-		pipeline := r.URL.Query().Get("pipeline")
-		if _, err := syntax.ParseTID(pipeline); err != nil {
-			writeXRPCError(w, http.StatusBadRequest, "InvalidRequest", "pipeline must be a valid TID")
-			return
+		var repo, pipeline string
+		notFound := "NotFound"
+		if scoped {
+			var ok bool
+			if repo, pipeline, ok = orgPipelineParams(w, r); !ok {
+				return
+			}
+			notFound = "PipelineNotFound"
+		} else {
+			pipeline = r.URL.Query().Get("pipeline")
+			if _, err := syntax.ParseTID(pipeline); err != nil {
+				writeXRPCError(w, http.StatusBadRequest, "InvalidRequest", "pipeline must be a valid TID")
+				return
+			}
 		}
 		raw, _, err := st.GetRawPipeline(r.Context(), pipeline)
-		if errors.Is(err, sql.ErrNoRows) {
-			writeXRPCError(w, http.StatusNotFound, "NotFound", "pipeline not found")
+		if errors.Is(err, sql.ErrNoRows) || (err == nil && scoped && pipelineRepoDID(raw) != repo) {
+			writeXRPCError(w, http.StatusNotFound, notFound, "pipeline not found")
 			return
 		}
 		if err != nil || raw.TriggerMetadata == nil || raw.TriggerMetadata.Repo == nil {
@@ -227,6 +298,10 @@ func ciSubscribePipelineLogsHandler(
 		workflows = uniqueWorkflows
 		if len(workflows) == 0 {
 			writeXRPCError(w, http.StatusBadRequest, "InvalidRequest", "pipeline has no workflows")
+			return
+		}
+		if len(workflows) > maxLogWorkflows {
+			writeXRPCError(w, http.StatusBadRequest, "InvalidRequest", "too many workflows requested")
 			return
 		}
 
@@ -272,7 +347,7 @@ func ciSubscribePipelineLogsHandler(
 
 		// Followers may block briefly on provider APIs. A bounded fan-in buffer lets
 		// another workflow continue without allowing an unbounded slow-client queue.
-		events := make(chan *tangled.CiSubscribePipelineLogs_Event, 128)
+		events := make(chan workflowLogLine, 128)
 		var wg sync.WaitGroup
 		for _, stream := range streams {
 			wg.Add(1)
@@ -315,7 +390,7 @@ func ciSubscribePipelineLogsHandler(
 				if err != nil {
 					return
 				}
-				if err := event.Serialize(writer); err != nil {
+				if err := logFrame(scoped, event).Serialize(writer); err != nil {
 					writer.Close()
 					logger.Error("serialize pipeline log", "err", err)
 					return
@@ -331,7 +406,7 @@ func ciSubscribePipelineLogsHandler(
 // followProviderLogs adapts providers' snapshot-oriented log APIs to Tangled's
 // long-lived subscription. It retries while a workflow is active and emits
 // only frames appended since the previous snapshot. This also closes the race
-// where appview subscribes before an asynchronous provider has persisted its
+// where a client subscribes before an asynchronous provider has persisted its
 // run mapping.
 func followProviderLogs(
 	ctx context.Context,
@@ -339,7 +414,7 @@ func followProviderLogs(
 	st *store,
 	provider Provider,
 	knot, pipeline, workflow string,
-	out chan<- *tangled.CiSubscribePipelineLogs_Event,
+	out chan<- workflowLogLine,
 ) {
 	followProviderLogsWithInterval(
 		ctx, logger, st, provider, knot, pipeline, workflow, out, 15*time.Second,
@@ -356,7 +431,7 @@ func followProviderLogsWithInterval(
 	st *store,
 	provider Provider,
 	knot, pipeline, workflow string,
-	out chan<- *tangled.CiSubscribePipelineLogs_Event,
+	out chan<- workflowLogLine,
 	pollInterval time.Duration,
 ) {
 	// A snapshot repeats all prior frames. Step-local counters are necessary:
@@ -401,7 +476,7 @@ func followProviderLogsWithInterval(
 						}
 						started[line.StepId] = true
 						select {
-						case out <- ciLogEvent(workflow, line):
+						case out <- workflowLogLine{workflow: workflow, line: line}:
 						case <-ctx.Done():
 							return
 						}
@@ -412,7 +487,7 @@ func followProviderLogsWithInterval(
 					snapshotData[line.StepId] = index + 1
 					if index >= emittedData[line.StepId] {
 						select {
-						case out <- ciLogEvent(workflow, line):
+						case out <- workflowLogLine{workflow: workflow, line: line}:
 						case <-ctx.Done():
 							return
 						}
@@ -459,7 +534,7 @@ func followProviderLogsWithInterval(
 			}
 			for _, line := range endLines {
 				select {
-				case out <- ciLogEvent(workflow, line):
+				case out <- workflowLogLine{workflow: workflow, line: line}:
 				case <-ctx.Done():
 					return
 				}
@@ -500,9 +575,51 @@ func isTerminalPipelineStatus(status string) bool {
 	}
 }
 
-// ciLogEvent converts the provider-neutral LogLine into one branch of the
-// subscription union. It fills protocol defaults for old providers that omit
-// timestamps, stream names, or step kinds.
+// workflowLogLine is one provider log line tagged with the workflow it came from.
+// Followers send these protocol-neutral values so the same polling code serves both
+// API generations. Only the WebSocket writer chooses an encoding, through logFrame.
+type workflowLogLine struct {
+	workflow string
+	line     LogLine
+}
+
+// logFrame returns the wire message for event: an org.tangled frame when scoped is
+// true and a legacy sh.tangled frame otherwise. Both serialize as the same atproto
+// event-stream framing, but only the current frames carry step outcomes, because the
+// generated sh.tangled type in the pinned Tangled v1.16 module has no field for them.
+func logFrame(scoped bool, event workflowLogLine) interface{ Serialize(io.Writer) error } {
+	if scoped {
+		return orgLogEvent(event.workflow, event.line)
+	}
+	return ciLogEvent(event.workflow, event.line)
+}
+
+// orgLogEvent converts a LogLine into an org.tangled.ci.subscribePipelineLogs
+// message. It reuses ciLogEvent so both generations apply the same defaults, then adds the step
+// outcome to end markers (see LogLine.StepOutcome for why the web app needs it). Start markers
+// never carry an outcome, even when the provider set one.
+func orgLogEvent(workflow string, line LogLine) *orgtangled.LogEvent {
+	legacy := ciLogEvent(workflow, line)
+	if c := legacy.Control; c != nil {
+		control := &orgtangled.LogControl{
+			Time: c.Time, Workflow: c.Workflow, Step: c.Step, Content: c.Content,
+			Command: c.Command, Status: c.Status, Kind: c.Kind,
+		}
+		if line.StepStatus == StepStatusEnd {
+			control.Outcome = optionalString(line.StepOutcome)
+		}
+		return &orgtangled.LogEvent{Control: control}
+	}
+	d := legacy.Data
+	return &orgtangled.LogEvent{Data: &orgtangled.LogData{
+		Time: d.Time, Workflow: d.Workflow, Step: d.Step, Content: d.Content, Stream: d.Stream,
+	}}
+}
+
+// ciLogEvent converts the provider-neutral LogLine into one branch of the legacy
+// sh.tangled.ci.subscribePipelineLogs union. It fills protocol defaults for providers that omit
+// timestamps, stream names, or step kinds. orgLogEvent builds on it, so these defaults apply to
+// both API generations.
 func ciLogEvent(workflow string, line LogLine) *tangled.CiSubscribePipelineLogs_Event {
 	timestamp := line.Time
 	if timestamp.IsZero() {

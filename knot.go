@@ -1,24 +1,28 @@
 package main
 
-// Knot event-stream subscriber.
+// Knot event-stream subscriber for Go knots (the legacy Tangled v1.16 protocol).
 //
-// Tangled knot servers expose a websocket at ws[s]://<knot>/events that
-// streams JSON-wrapped record events for that knot. Since Tangled 1.14,
-// sh.tangled.git.refUpdate is the CI input: the spindle discovers workflows
-// and creates the sh.tangled.pipeline record itself.
+// knot2, the Rust knot shipped with Tangled v1.20, has no /events stream. It reports pushes by
+// POSTing org.tangled.event.notifyEvent to the spindle instead, which notify.go handles. If a
+// legacy sh.tangled.repo record names a knot2 host, the dial here fails and eventconsumer keeps
+// retrying with backoff that starts at 15 minutes and caps at one hour. The failure stays
+// contained to that one source and does not affect other knots.
 //
-// We use tangled-core's `eventconsumer` package, which already handles
-// per-source connection management, retries, ordered processing and
-// cursor tracking. We hand it:
+// Go knots expose a websocket at ws[s]://<knot>/events that streams JSON-wrapped record events
+// for that knot. Since Tangled v1.14, sh.tangled.git.refUpdate is the CI input: the spindle
+// discovers workflows and creates the sh.tangled.pipeline record itself.
 //
-//   1. The initial set of knots, derived from previously-observed
-//      sh.tangled.repo records that named us as their .spindle field.
-//   2. A ProcessFunc that turns authorized ref updates into provider builds.
+// We use tangled-core's eventconsumer package, which handles per-source connection management,
+// dial retries, and cursor tracking. We hand it:
 //
-// The jetstream consumer also gets a back-reference (via the
-// KnotConsumer interface) so it can dynamically subscribe a new knot —
-// or unsubscribe one — the moment a matching sh.tangled.repo record
-// arrives, without waiting for a tack restart.
+//  1. The initial set of knots, taken from stored sh.tangled.repo records that name this
+//     spindle in their spindle field and were published by an authorized DID.
+//  2. A ProcessFunc that turns authorized ref updates into provider builds and applies knot
+//     collaborator updates.
+//
+// The jetstream consumer also holds a KnotConsumer, so it can subscribe to a new knot, or drop
+// one, as soon as a matching sh.tangled.repo record or spindle membership change arrives, without
+// waiting for a Tack restart.
 
 import (
 	"context"

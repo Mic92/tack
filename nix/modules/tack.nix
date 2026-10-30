@@ -29,8 +29,55 @@ in
         type = types.str;
         example = "tack.example.com";
         description = ''
-          Public hostname this spindle is registered under in Tangled
-          (matches `sh.tangled.repo.spindle`). Required.
+          Public hostname this spindle is registered under in Tangled (TACK_HOSTNAME).
+          Tack's DID is `did:web:<hostname>`. Tangled v1.20 repos select Tack by putting that DID
+          in the `spindle` field of their repo manifest (the knot-hosted
+          `org.tangled.repo.manifest` record). Legacy `sh.tangled.repo` records name the bare
+          hostname instead. Tack must be served over HTTPS at this exact host with no
+          redirects: knot2 fetches `/.well-known/did.json` from it before every push delivery,
+          and the Tangled web app refuses redirected spindle requests. Required.
+        '';
+      };
+
+      corsOrigins = mkOption {
+        type = types.listOf types.str;
+        default = [ "https://tangled.org" ];
+        example = [ "*" ];
+        description = ''
+          Browser origins allowed to call Tack's `/xrpc` routes (TACK_CORS_ORIGINS, joined
+          with commas). The Tangled web app calls spindles from the user's browser, so its
+          pipeline views stay empty unless its origin is listed. `"*"` allows every origin.
+          That is safe because Tack never relies on cookies: write calls such as retry and approve
+          authenticate with a service auth token (a signed atproto JWT) that the calling page
+          must attach itself. An empty list disables CORS.
+        '';
+      };
+
+      keyPath = mkOption {
+        # types.str rather than types.path, so a path literal is rejected instead of being
+        # copied into the world-readable Nix store when it is interpolated below.
+        type = types.nullOr types.str;
+        default = null;
+        example = "/var/lib/tack/spindle.pem";
+        description = ''
+          Path to an optional P-256 private key in PEM form, SEC1 or PKCS#8 (TACK_KEY_PATH).
+          Its public half is published in Tack's did:web document so the document matches
+          the upstream spindle's. Tack signs nothing with it, and no Tangled v1.20 service
+          requires it. Leave it unset to publish a document without a key. Generate one with
+          `openssl ecparam -name prime256v1 -genkey -noout -out spindle.pem`. Keep the file
+          outside the Nix store. The service runs as a systemd DynamicUser, which has no fixed
+          UID to give the file to, so the state directory (as in the example) is the simplest
+          place: systemd hands everything there to the service's user at startup. Tack refuses
+          to start if the file is missing, unreadable, or not a PEM-encoded P-256 key.
+        '';
+      };
+
+      contactEmail = mkOption {
+        type = types.nullOr types.str;
+        default = null;
+        description = ''
+          Operator contact email reported by `org.tangled.spindle.describeSpindle`
+          (TACK_CONTACT_EMAIL). Leave it unset to omit the contact.
         '';
       };
 
@@ -199,8 +246,15 @@ in
                 "TACK_REPO_DIR=${cfg.repoDir}"
                 "TACK_JETSTREAM_URL=${cfg.jetstreamUrl}"
                 "TACK_BUILDKITE_WEBHOOK_MODE=${cfg.buildkite.webhookMode}"
+                # Always set, even when empty. Tack falls back to https://tangled.org only
+                # when the variable is unset, so an empty list must reach it as "" to
+                # disable CORS.
+                "TACK_CORS_ORIGINS=${lib.concatStringsSep "," cfg.corsOrigins}"
               ]
               ++ optional cfg.dev "TACK_DEV=1"
+              ++ optional (cfg.keyPath != null) "TACK_KEY_PATH=${cfg.keyPath}"
+              ++ optional (cfg.contactEmail != null)
+              "TACK_CONTACT_EMAIL=${cfg.contactEmail}"
               ++ optional (cfg.buildkite.org != null)
               "TACK_BUILDKITE_ORG=${cfg.buildkite.org}"
               ++ optional cfg.tekton.enable "TACK_TEKTON_ENABLED=1"

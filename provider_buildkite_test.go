@@ -812,3 +812,21 @@ func TestStripTerminal(t *testing.T) {
 		})
 	}
 }
+
+// TestBuildkiteJobOutcome pins which Buildkite job states put an outcome on a step's end
+// marker, the control log line that closes the step. Only "passed" (success) and "failed",
+// "timed_out", and "canceled" (failure) map to one. Running, skipped, and broken jobs must map
+// to the empty string so the end marker claims no result Tack did not observe. This differs on
+// purpose from the upstream spindle, which always sends an outcome because it ends a step only
+// after the step returns. The Tangled web app uses the outcome to mark the failed step, so a
+// wrong value here points the user at the wrong step.
+func TestBuildkiteJobOutcome(t *testing.T) {
+	for state, want := range map[string]string{
+		"passed": StepOutcomeSuccess, "failed": StepOutcomeFailed, "timed_out": StepOutcomeFailed,
+		"canceled": StepOutcomeFailed, "running": "", "broken": "", "skipped": "",
+	} {
+		if got := buildkiteJobOutcome(state); got != want {
+			t.Errorf("buildkiteJobOutcome(%q) = %q; want %q", state, got, want)
+		}
+	}
+}

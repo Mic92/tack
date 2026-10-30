@@ -1,8 +1,8 @@
 package main
 
-// Pipeline creation for the post-1.13 Tangled protocol. Knots now emit git
-// ref updates; the spindle owns workflow discovery, pipeline IDs, and retained
-// pipeline records.
+// Pipeline creation shared by every trigger path since Tangled v1.13. Go knots report git ref
+// updates and knot2 sends push notifications. In both cases the spindle owns workflow discovery,
+// pipeline IDs, and retained pipeline records.
 
 import (
 	"compress/gzip"
@@ -12,12 +12,14 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"syscall"
@@ -33,9 +35,10 @@ import (
 	knotdb "tangled.org/core/knotserver/db"
 	"tangled.org/core/patchutil"
 	"tangled.org/core/repoident"
-	"tangled.org/core/repoverify"
 	"tangled.org/core/tid"
 	"tangled.org/core/workflow"
+
+	"go.mitchellh.com/tack/internal/orgtangled"
 )
 
 // errNoMatchingWorkflows distinguishes a valid trigger that selected nothing
@@ -64,21 +67,22 @@ type pullRevisionFetcher func(
 	*tangled.RepoPull,
 ) (string, error)
 
-// verifiedRepoCache holds canonical repository identity data resolved from the
-// repo DID. Entries are short-lived because repository DIDs can migrate knots;
-// repo-record mutations also invalidate the entire cache immediately.
+// verifiedRepoCache holds canonical repository identity data resolved from the repo DID. Entries
+// are short-lived because repository DIDs can migrate knots. Mirrored repo record and spindle
+// membership changes also clear the whole cache at once (see invalidateRepoCaches).
 type verifiedRepoCache struct {
 	repo    *RepoRef
 	expires time.Time
 }
 
-// pipelineService owns the post-1.13 Spindle pipeline lifecycle. It verifies
-// trigger provenance, checks out workflow definitions, persists the
-// spindle-owned pipeline record, and only then dispatches work to a Provider.
+// pipelineService owns the post-1.13 spindle pipeline lifecycle. It verifies trigger provenance,
+// checks out workflow definitions, persists the spindle-owned pipeline record, and only then
+// dispatches work to a Provider.
 //
-// The function-valued fields are production dependencies with test seams. The
-// two mutex domains deliberately stay separate: repoLocks serialize mutable Git
-// worktrees, while verifiedMu protects the short-lived identity cache.
+// The function-valued fields are production dependencies with test seams. The mutexes deliberately
+// guard separate domains so that slow work under one never blocks the others: repoLocks serialize
+// mutable Git worktrees, repoCacheMu guards the short-lived identity and served-repo caches, and
+// inflightPushesMu guards the table of pushes currently being processed.
 type pipelineService struct {
 	// rootCtx outlives request contexts and scopes asynchronous provider work.
 	rootCtx context.Context
@@ -92,16 +96,40 @@ type pipelineService struct {
 	fetchPullRevision    pullRevisionFetcher
 	resolveDefaultBranch func(context.Context, *RepoRef) string
 	directory            identity.Directory
-	verify               repoverify.Verifier
-	repoLocksMu          sync.Mutex
-	repoLocks            map[string]*sync.Mutex
-	verifiedMu           sync.Mutex
-	verifiedRepos        map[string]verifiedRepoCache
+	// verify resolves a repo DID to its canonical knot, owner, and record key.
+	verify repoVerifier
+	// resolveKnot returns only the host of the knot that a repo DID document names. servePushEvent
+	// compares the service auth issuer against it before reading any record the knot asserts, so a
+	// knot cannot report pushes for repositories it does not host.
+	resolveKnot func(context.Context, string) (string, error)
+	// ownerDeclares reports whether the owner of a repository found through its repo manifest
+	// confirms, from a record they published, that the repository is theirs. Without it a knot
+	// could name any admitted owner and run CI on the operator's provider accounts.
+	ownerDeclares func(context.Context, *RepoRef) (bool, error)
+	// listCollaborators returns the collaborator DIDs that a knot2 repository grants, read live
+	// from the knot. It is never served from the local mirror.
+	listCollaborators func(context.Context, *RepoRef) ([]string, error)
+	repoLocksMu       sync.Mutex
+	repoLocks         map[string]*sync.Mutex
+	// repoCacheMu guards both verifiedRepos and servedRepos, which are always invalidated together.
+	repoCacheMu   sync.Mutex
+	verifiedRepos map[string]verifiedRepoCache
+	// servedRepos caches the complete "does Tack serve this repo" decision, including refusals, so
+	// public queries cannot turn into unbounded knot and PDS traffic.
+	servedRepos map[string]servedRepoCache
+	// lookupSlots is a semaphore, sized by its channel capacity, that caps uncached lookups started
+	// by unauthenticated routes (lookupPublicRepo). Trusted trigger paths never take a slot, so
+	// public traffic cannot starve them. A full pool returns errLookupBusy instead of queueing.
+	lookupSlots      chan struct{}
+	inflightPushesMu sync.Mutex
+	// inflightPushes maps a push (repo DID, ref, old SHA, new SHA) to its running work, so a knot2
+	// retry joins that work instead of starting a second checkout and compile.
+	inflightPushes map[string]*pushCall
 }
 
-// newPipelineService wires production identity, HTTP, checkout, and compiler
-// dependencies. The service is shared by knot events, Jetstream pulls, and CI
-// XRPC procedures so every trigger path applies the same authorization rules.
+// newPipelineService wires production identity, HTTP, checkout, and compiler dependencies. The
+// service is shared by Go knot events, Jetstream pulls, knot2 push notifications, and the CI XRPC
+// procedures, so every trigger path applies the same authorization rules.
 func newPipelineService(
 	rootCtx context.Context,
 	cfg config,
@@ -112,20 +140,32 @@ func newPipelineService(
 	resolver := idresolver.DefaultResolver(identity.DefaultPLCURL)
 	httpClient := newPipelineHTTPClient(cfg.Dev)
 	p := &pipelineService{
-		rootCtx:       rootCtx,
-		httpClient:    httpClient,
-		cfg:           cfg,
-		store:         st,
-		broker:        br,
-		provider:      provider,
-		directory:     identity.DefaultDirectory(),
-		verify:        newRepoVerifier(resolver.Directory(), httpClient, cfg.Dev),
-		repoLocks:     make(map[string]*sync.Mutex),
-		verifiedRepos: make(map[string]verifiedRepoCache),
+		rootCtx:        rootCtx,
+		httpClient:     httpClient,
+		cfg:            cfg,
+		store:          st,
+		broker:         br,
+		provider:       provider,
+		directory:      identity.DefaultDirectory(),
+		verify:         newRepoVerifier(resolver.Directory(), httpClient, cfg.Dev),
+		repoLocks:      make(map[string]*sync.Mutex),
+		verifiedRepos:  make(map[string]verifiedRepoCache),
+		servedRepos:    make(map[string]servedRepoCache),
+		lookupSlots:    make(chan struct{}, 2),
+		inflightPushes: make(map[string]*pushCall),
 	}
 	p.load = p.loadWorkflows
 	p.fetchPullRevision = p.fetchLatestPullRevision
 	p.resolveDefaultBranch = p.defaultBranch
+	p.resolveKnot = func(ctx context.Context, repoDID string) (string, error) {
+		knot, err := resolveRepoKnot(ctx, resolver.Directory(), repoDID, cfg.Dev)
+		if err != nil {
+			return "", err
+		}
+		return knot.Host, nil
+	}
+	p.ownerDeclares = p.ownerDeclaresRepo
+	p.listCollaborators = p.knotCollaborators
 	return p
 }
 
@@ -164,6 +204,13 @@ func (p *pipelineService) processRefUpdate(
 	}
 	if skipsCI(event.PushOptions) {
 		logger.Info("push requested CI skip")
+		return nil
+	}
+	// Go knots emit a refUpdate with an empty ref and empty SHAs when the default branch changes,
+	// and a zero new SHA means the ref was deleted. Neither has a commit to build, and fetching an
+	// empty revision can only fail.
+	if event.Ref == "" || event.NewSha == "" || isZeroSHA(event.NewSha) {
+		logger.Debug("ignoring ref update without a new commit")
 		return nil
 	}
 
@@ -298,7 +345,10 @@ func (p *pipelineService) triggerPipeline(
 	if _, err := syntax.ParseDID(input.Repo); err != nil {
 		return "", fmt.Errorf("invalid repository DID %q: %w", input.Repo, err)
 	}
-	target, err := p.managedRepo(ctx, input.Repo)
+	// The caller is authenticated, so skipping the local assignment check is safe. That lets knot2
+	// repositories that name Tack only in their repo manifest be found here without a mirrored
+	// legacy sh.tangled.repo record.
+	target, err := p.servedRepo(ctx, input.Repo)
 	if err != nil {
 		return "", err
 	}
@@ -384,10 +434,8 @@ func (p *pipelineService) triggerPipeline(
 	return pipelineATURI(target.Knot, rkey), nil
 }
 
-// run is the common commit point for every trigger source. It compiles and
-// filters workflows, persists the immutable pipeline definition, and dispatches
-// the provider only after persistence succeeds so query/log requests can never
-// observe provider work without a corresponding pipeline.
+// run compiles workflows for a trigger and hands the result to dispatch. A non-empty only limits
+// the run to the workflows it names. It returns errNoMatchingWorkflows when nothing is left to run.
 func (p *pipelineService) run(
 	ctx context.Context,
 	target, source *RepoRef,
@@ -400,9 +448,9 @@ func (p *pipelineService) run(
 		return "", fmt.Errorf("load workflows: %w", err)
 	}
 	if len(only) > 0 {
-		// Explicit retries may select one workflow from the original pipeline.
-		// Filter after compilation so ordinary trigger constraints and diagnostics
-		// still behave exactly like a full run.
+		// Legacy triggerPipeline retries and manual runs may name a subset of workflows. Filter
+		// after compilation so ordinary trigger constraints and diagnostics still behave exactly
+		// like a full run.
 		allowed := make(map[string]struct{}, len(only))
 		for _, name := range only {
 			allowed[name] = struct{}{}
@@ -420,6 +468,20 @@ func (p *pipelineService) run(
 	if len(workflows) == 0 {
 		return "", errNoMatchingWorkflows
 	}
+	return p.dispatch(ctx, target, trigger, workflows)
+}
+
+// dispatch is the common commit point for every new pipeline. It persists the pipeline record and
+// starts the provider only after persistence succeeds, so query and log requests never see provider
+// work without a pipeline. It returns the new pipeline's record key. It is split from run so
+// retryPipeline can pass the original pipeline's stored workflows: a rerun executes exactly what
+// ran before, not whatever the branch holds now.
+func (p *pipelineService) dispatch(
+	ctx context.Context,
+	target *RepoRef,
+	trigger *tangled.Pipeline_TriggerMetadata,
+	workflows []*tangled.Pipeline_Workflow,
+) (string, error) {
 	if err := p.rootCtx.Err(); err != nil {
 		return "", fmt.Errorf("spindle is shutting down: %w", err)
 	}
@@ -449,6 +511,9 @@ func (p *pipelineService) run(
 // upstream compiler with the trigger metadata and changed-file set. The lock is
 // held through both checkout and file reads: releasing it after checkout would
 // let a concurrent push replace the worktree before we finish compiling it.
+//
+// A revision the knot refuses to serve is returned as a *permanentError, since retrying cannot
+// change that answer.
 func (p *pipelineService) loadWorkflows(
 	ctx context.Context,
 	source *RepoRef,
@@ -476,6 +541,11 @@ func (p *pipelineService) loadWorkflows(
 	unlock := p.lockRepo(source.RepoDID)
 	defer unlock()
 	if err := syncWorkflowRepo(ctx, cloneURL, repoPath, revision); err != nil {
+		if isRefusedRevision(err) {
+			// servePushEvent answers a permanentError with 422, so knot2 drops the event instead of
+			// retrying it ahead of the rest of its queue.
+			return nil, &permanentError{fmt.Errorf("sync repository: %w", err)}
+		}
 		return nil, fmt.Errorf("sync repository: %w", err)
 	}
 
@@ -499,16 +569,51 @@ func (p *pipelineService) loadWorkflows(
 		raw = append(raw, workflow.RawWorkflow{Name: entry.Name(), Contents: contents})
 	}
 
-	compiler := workflow.Compiler{Trigger: *trigger, ChangedFiles: changedFiles}
-	compiled := compiler.Compile(compiler.Parse(raw))
+	// knot2 push notifications carry no changed-file list, so recover it from Git when possible.
+	// When it stays unknown, compileWorkflows runs paths-gated workflows instead of skipping them,
+	// as the upstream spindle does, because missing CI is worse than extra CI.
+	unknownChanges := false
+	if trigger.Push != nil && changedFiles == nil {
+		var ok bool
+		changedFiles, ok = pushChangedFiles(ctx, repoPath, trigger.Push.OldSha, trigger.Push.NewSha)
+		unknownChanges = !ok
+	}
 	logger := loggerFrom(ctx).With("component", "pipeline", "repo_did", source.RepoDID)
+	return compileWorkflows(logger, raw, trigger, changedFiles, unknownChanges), nil
+}
+
+// compileWorkflows parses and compiles raw with the upstream compiler and logs its diagnostics.
+// Invalid or skipped workflows are logged, not returned as errors, because one bad file must not
+// block the repository's other workflows.
+//
+// When unknownChanges is true, every `paths` constraint is removed before compiling. A paths-gated
+// workflow then runs whenever its other conditions match, which is how upstream treats an unknown
+// changed-file set. Without this, the core v1.16 compiler would read the nil list as "nothing
+// changed" and silently skip those workflows.
+func compileWorkflows(
+	logger *slog.Logger,
+	raw workflow.RawPipeline,
+	trigger *tangled.Pipeline_TriggerMetadata,
+	changedFiles []string,
+	unknownChanges bool,
+) []*tangled.Pipeline_Workflow {
+	compiler := workflow.Compiler{Trigger: *trigger, ChangedFiles: changedFiles}
+	parsed := compiler.Parse(raw)
+	if unknownChanges {
+		for i := range parsed {
+			for j := range parsed[i].When {
+				parsed[i].When[j].Paths = nil
+			}
+		}
+	}
+	compiled := compiler.Compile(parsed)
 	for _, diagnostic := range compiler.Diagnostics.Errors {
 		logger.Error("invalid workflow", "error", diagnostic.String())
 	}
 	for _, diagnostic := range compiler.Diagnostics.Warnings {
 		logger.Warn("workflow skipped", "warning", diagnostic.String())
 	}
-	return compiled.Workflows, nil
+	return compiled.Workflows
 }
 
 // lockRepo acquires the mutex for one repository cache and returns its unlock
@@ -531,6 +636,17 @@ func (p *pipelineService) lockRepo(repoDID string) func() {
 // trixie currently ships 2.47.
 func syncWorkflowRepo(ctx context.Context, cloneURL, repoPath, revision string) error {
 	gitDir := filepath.Join(repoPath, ".git")
+	// A Git repository's object format (SHA-1 or SHA-256) is fixed at init, and a SHA-1 repository
+	// cannot even name a SHA-256 commit. The cache must therefore match the format of the requested
+	// revision.
+	format := objectFormat(revision)
+	if _, err := os.Stat(gitDir); err == nil && cacheObjectFormat(ctx, repoPath) != format {
+		// The cache predates format detection, or the repository was replaced by one in the other
+		// format. The cache is disposable, so start over rather than fail every later fetch.
+		if err := os.RemoveAll(repoPath); err != nil {
+			return fmt.Errorf("remove mismatched repository cache: %w", err)
+		}
+	}
 	// Initialize manually rather than cloning so Debian's pre-2.49 Git can use
 	// the same workflow. A non-Git cache directory is always disposable because
 	// repoPath is a Tack-owned hash beneath TACK_REPO_DIR.
@@ -538,7 +654,7 @@ func syncWorkflowRepo(ctx context.Context, cloneURL, repoPath, revision string) 
 		if err := os.RemoveAll(repoPath); err != nil {
 			return fmt.Errorf("remove invalid repository cache: %w", err)
 		}
-		if err := runGit(ctx, "init", repoPath); err != nil {
+		if err := runGit(ctx, "init", "--object-format="+format, repoPath); err != nil {
 			return err
 		}
 		if err := runGit(ctx, "-C", repoPath, "remote", "add", "origin", cloneURL); err != nil {
@@ -563,6 +679,103 @@ func syncWorkflowRepo(ctx context.Context, cloneURL, repoPath, revision string) 
 		return err
 	}
 	return runGit(ctx, "-C", repoPath, "checkout", "--detach", "FETCH_HEAD")
+}
+
+// maxChangedFiles matches the upstream spindle's limit on changed-file entries. A longer list is
+// treated as unknown, which runs every paths-gated workflow. Upstream also caps the list's total
+// size in bytes. Tack does not.
+const maxChangedFiles = 8192
+
+// pushChangedFiles lists the paths a push changed by diffing oldSHA and newSHA in the workflow
+// cache at repoPath. The second result is false when the set cannot be known: a ref creation or
+// deletion (a zero or empty SHA), a failed fetch or diff, or more than maxChangedFiles paths.
+// Callers then treat the set as unknown rather than empty.
+//
+// The cache is a treeless partial clone, so oldSHA is fetched as a single commit without trees. The
+// name-only diff then fetches the trees it needs on demand and never downloads file contents.
+func pushChangedFiles(ctx context.Context, repoPath, oldSHA, newSHA string) ([]string, bool) {
+	if oldSHA == "" || isZeroSHA(oldSHA) || newSHA == "" || isZeroSHA(newSHA) {
+		return nil, false
+	}
+	if err := runGit(
+		ctx, "-C", repoPath, "fetch", "--depth=1", "--filter=tree:0", "origin", oldSHA,
+	); err != nil {
+		return nil, false
+	}
+	output, err := exec.CommandContext(
+		ctx, "git", "-C", repoPath, "diff", "--name-only", "--no-renames", "-z", oldSHA, newSHA,
+	).Output()
+	if err != nil {
+		return nil, false
+	}
+	files := make([]string, 0)
+	for name := range strings.SplitSeq(string(output), "\x00") {
+		if name != "" {
+			files = append(files, name)
+		}
+	}
+	if len(files) > maxChangedFiles {
+		return nil, false
+	}
+	return files, true
+}
+
+// permanentError marks a push failure that a retry cannot fix. servePushEvent answers it with
+// 422 so knot2 drops the event instead of retrying it for days at the head of its queue (see the
+// notify.go file comment for how knot2 reads status codes).
+type permanentError struct{ err error }
+
+// Error returns the wrapped error's message.
+func (e *permanentError) Error() string { return e.err.Error() }
+
+// Unwrap returns the wrapped error so errors.Is and errors.As see through the marker.
+func (e *permanentError) Unwrap() error { return e.err }
+
+// isRefusedRevision reports whether a Git fetch failed because the server will not serve the
+// requested commit. It matches the two upload-pack messages the upstream spindle treats as a
+// refusal, plus "couldn't find remote ref". Unlike upstream, it does not treat HTTP 4xx answers or
+// a "repository '...' not found" message as refusals, so those failures stay retryable.
+func isRefusedRevision(err error) bool {
+	message := err.Error()
+	for _, marker := range []string{
+		"not our ref",
+		"unadvertised object",
+		"couldn't find remote ref",
+	} {
+		if strings.Contains(message, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+// isZeroSHA reports whether sha is Git's all-zero object ID, which knots send for the missing side
+// of a ref creation or deletion. Any non-empty run of zeros qualifies, which covers both the SHA-1
+// and SHA-256 widths.
+func isZeroSHA(sha string) bool {
+	return sha != "" && strings.Trim(sha, "0") == ""
+}
+
+// objectFormat returns the Git object format name ("sha1" or "sha256") for a hex object ID, judged
+// by its length. Anything other than 64 characters is taken as SHA-1, Git's default format.
+func objectFormat(revision string) string {
+	if len(revision) == 64 {
+		return "sha256"
+	}
+	return "sha1"
+}
+
+// cacheObjectFormat returns the object format of the repository at repoPath, or "" when Git cannot
+// tell. An empty result never equals a real format, so syncWorkflowRepo treats it as a mismatch and
+// rebuilds the cache.
+func cacheObjectFormat(ctx context.Context, repoPath string) string {
+	output, err := exec.CommandContext(
+		ctx, "git", "-C", repoPath, "rev-parse", "--show-object-format",
+	).Output()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(output))
 }
 
 // runGit executes one bounded-by-context Git operation and includes stderr in
@@ -665,19 +878,28 @@ func (p *pipelineService) fetchLatestPullRevision(
 	return patches[len(patches)-1].SHA, nil
 }
 
-// defaultBranch asks the authoritative knot for display/provider metadata used
-// by manual runs. Failure is intentionally soft: the requested SHA remains
-// sufficient to run, and providers can tolerate an empty branch.
+// defaultBranch asks the authoritative knot for the default branch, which manual runs and knot2
+// pushes pass to providers as display metadata. Failure is intentionally soft: the requested SHA is
+// enough to run, and providers tolerate an empty branch.
 func (p *pipelineService) defaultBranch(ctx context.Context, repo *RepoRef) string {
-	host, noTLS, err := hostutil.ParseHostname(repo.Knot)
+	base, err := p.knotBaseURL(repo.Knot)
 	if err != nil {
 		return ""
 	}
-	scheme := "https"
-	if noTLS || p.cfg.Dev {
-		scheme = "http"
+	// knot2 publishes the default branch in its org.tangled.git.refs record and does not serve
+	// sh.tangled.repo.getDefaultBranch. A readable record is authoritative even when it names no
+	// branch. The legacy query below runs only when the record cannot be read, as on Go knots,
+	// which do not publish it.
+	var refs orgtangled.GitRefs
+	if err := getRecord(
+		ctx, p.httpClient, base, repo.RepoDID, orgtangled.NSIDGitRefs, "self", &refs,
+	); err == nil {
+		if refs.DefaultBranch != nil {
+			return strings.TrimPrefix(*refs.DefaultBranch, "refs/heads/")
+		}
+		return ""
 	}
-	client := &indigoxrpc.Client{Host: fmt.Sprintf("%s://%s", scheme, host)}
+	client := &indigoxrpc.Client{Host: base, Client: p.httpClient}
 	result, err := tangled.RepoGetDefaultBranch(ctx, client, repo.RepoDID)
 	if err != nil {
 		return ""
@@ -724,15 +946,34 @@ func newPipelineHTTPClient(dev bool) *http.Client {
 	return client
 }
 
-// authorizeRepoActor first checks the local collaborator mirror, then queries
-// the authoritative knot on a miss. The fallback makes pre-existing knot ACLs
-// usable after a fresh Tack install, whose event cursor only sees later changes;
-// a successful lookup is mirrored locally for subsequent requests.
+// authorizeRepoActor reports whether actor owns or collaborates on repo. For repositories found
+// through a knot2 repo manifest, the owner is accepted directly and every other actor is checked
+// live against the knot. Go knot repositories first check the local collaborator mirror, then query
+// the authoritative knot on a miss. That fallback makes collaborator grants that predate a fresh
+// Tack install usable, since the event cursor only sees later changes. A successful lookup is
+// mirrored locally for later requests.
 func (p *pipelineService) authorizeRepoActor(
 	ctx context.Context,
 	repo *RepoRef,
 	actor string,
 ) (bool, error) {
+	queryCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	if repo.FromManifest {
+		// knot2 grants are org.tangled.graph.collaborator records keyed by the collaborator DID,
+		// and the knot is the only source of truth. Local rows are skipped entirely. Tack follows
+		// no knot2 event stream, so a mirrored grant or a legacy PDS record would never see its
+		// revocation.
+		if actor == repo.OwnerDID {
+			return true, nil
+		}
+		collaborators, err := p.listCollaborators(queryCtx, repo)
+		if err != nil {
+			return false, fmt.Errorf("query knot collaborators: %w", err)
+		}
+		return slices.Contains(collaborators, actor), nil
+	}
+
 	authorized, err := p.store.IsRepoActorAuthorized(
 		ctx, repo.RepoDID, repo.OwnerDID, actor,
 	)
@@ -740,19 +981,11 @@ func (p *pipelineService) authorizeRepoActor(
 		return authorized, err
 	}
 
-	host, noTLS, err := hostutil.ParseHostname(repo.Knot)
+	base, err := p.knotBaseURL(repo.Knot)
 	if err != nil {
 		return false, err
 	}
-	scheme := "https"
-	if noTLS || p.cfg.Dev {
-		scheme = "http"
-	}
-	queryCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
-	defer cancel()
-	client := &indigoxrpc.Client{
-		Host: fmt.Sprintf("%s://%s", scheme, host), Client: p.httpClient,
-	}
+	client := &indigoxrpc.Client{Host: base, Client: p.httpClient}
 	cursor := ""
 	for page := 0; page < 10; page++ {
 		result, err := tangled.RepoListCollaborators(
@@ -777,11 +1010,12 @@ func (p *pipelineService) authorizeRepoActor(
 	return false, errors.New("knot collaborator list exceeded 1000 entries")
 }
 
-// managedRepo performs a cheap local assignment check before network
-// verification, then requires the mirrored record to agree with the canonical
-// knot, owner, and record key resolved from the repo DID. This two-phase shape
-// prevents unrelated global events from forcing verifier traffic and prevents
-// a forged sibling record from shadowing the real repository.
+// managedRepo performs a cheap local assignment check before network verification. It guards the
+// unauthenticated legacy inputs (Go knot /events streams and Jetstream pulls), where arbitrary
+// global traffic must not force verifier requests for repositories that no mirrored sh.tangled.repo
+// record assigns to Tack. Authenticated callers use servedRepo directly, which also finds knot2
+// repositories that name Tack only in their repo manifest. Unauthenticated queries use
+// lookupPublicRepo.
 func (p *pipelineService) managedRepo(ctx context.Context, repoDID string) (*RepoRef, error) {
 	managed, err := p.store.HasManagedRepo(
 		ctx, repoDID, p.cfg.Hostname, p.cfg.OwnerDID,
@@ -789,29 +1023,17 @@ func (p *pipelineService) managedRepo(ctx context.Context, repoDID string) (*Rep
 	if err != nil || !managed {
 		return nil, err
 	}
-	verified, err := p.verifiedRepo(ctx, repoDID)
-	if err != nil {
-		return nil, err
-	}
-	return p.store.ManagedRepoByDID(
-		ctx,
-		repoDID,
-		p.cfg.Hostname,
-		p.cfg.OwnerDID,
-		verified.Knot,
-		verified.OwnerDID,
-		verified.Rkey,
-	)
+	return p.servedRepo(ctx, repoDID)
 }
 
-// verifiedRepo resolves canonical repository identity with a five-minute cache.
-// Verification gets one short-delay retry because eventconsumer advances its
-// cursor even when processing returns an error; retrying here avoids losing a
-// push on a single transient resolver failure.
+// verifiedRepo resolves canonical repository identity with a five-minute cache of at most
+// repoCacheCapacity entries. When the cache is full of live entries, the result is returned without
+// being cached. Verification gets one short retry because eventconsumer advances its cursor even
+// when processing fails, and one transient resolver failure should not lose a push.
 func (p *pipelineService) verifiedRepo(ctx context.Context, value string) (*RepoRef, error) {
-	p.verifiedMu.Lock()
+	p.repoCacheMu.Lock()
 	cached, ok := p.verifiedRepos[value]
-	p.verifiedMu.Unlock()
+	p.repoCacheMu.Unlock()
 	if ok && time.Now().Before(cached.expires) {
 		copy := *cached.repo
 		return &copy, nil
@@ -835,26 +1057,28 @@ func (p *pipelineService) verifiedRepo(ctx context.Context, value string) (*Repo
 			return nil, fmt.Errorf("verify repository %q: %w", value, err)
 		}
 	}
-	repo := &RepoRef{
-		OwnerDID: verified.OwnerDid.String(),
-		Rkey:     verified.Rkey,
-		Knot:     verified.KnotURL.Host,
-		RepoDID:  verified.RepoDid.String(),
+	repo := verified
+	p.repoCacheMu.Lock()
+	if makeCacheRoom(p.verifiedRepos, repoCacheCapacity, func(entry verifiedRepoCache) time.Time {
+		return entry.expires
+	}) {
+		p.verifiedRepos[value] = verifiedRepoCache{repo: repo, expires: time.Now().Add(5 * time.Minute)}
 	}
-	p.verifiedMu.Lock()
-	p.verifiedRepos[value] = verifiedRepoCache{repo: repo, expires: time.Now().Add(5 * time.Minute)}
-	p.verifiedMu.Unlock()
+	p.repoCacheMu.Unlock()
 	copy := *repo
 	return &copy, nil
 }
 
-// invalidateRepoVerificationCache drops canonical identities after any mirrored
-// repo mutation. The cache is small and repo updates are rare, so clearing it is
-// simpler and safer than trying to infer which DID an update/delete displaced.
-func (p *pipelineService) invalidateRepoVerificationCache() {
-	p.verifiedMu.Lock()
+// invalidateRepoCaches drops all canonical identities and served-repo decisions after any mirrored
+// repo or spindle membership change. Membership decides whether any repository's owner is admitted
+// (admitManifestRepo for knot2, ManagedRepoByDID for Go knots), so a cached decision must not
+// outlive a grant or revocation. The caches are bounded and mutations rare, so clearing everything
+// is simpler and safer than inferring which DIDs an update affected.
+func (p *pipelineService) invalidateRepoCaches() {
+	p.repoCacheMu.Lock()
 	clear(p.verifiedRepos)
-	p.verifiedMu.Unlock()
+	clear(p.servedRepos)
+	p.repoCacheMu.Unlock()
 }
 
 // pipelineTriggerRepo converts the persisted repository identity into the
@@ -881,7 +1105,8 @@ func pointerValue(value *string) string {
 	return *value
 }
 
-// skipsCI recognizes both push-option spellings supported by current knots.
+// skipsCI recognizes both push-option spellings, skip-ci and ci-skip, that Go knots and knot2
+// accept.
 func skipsCI(options []string) bool {
 	for _, option := range options {
 		if option == "skip-ci" || option == "ci-skip" {

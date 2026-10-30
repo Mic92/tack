@@ -1,15 +1,22 @@
 package main
 
-// HTTP surface of the spindle.
+// This file serves the spindle's HTTP surface.
 //
-// Three roles to keep in mind:
+// The server plays four roles:
 //
-//  1. Verification: the Tangled appview hits /xrpc/sh.tangled.owner during
-//     spindle registration to confirm the operator owns this instance.
-//  2. CI XRPC: the appview queries spindle-owned pipelines and subscribes to
-//     CBOR-framed logs under /xrpc/sh.tangled.ci.*.
-//  3. Webhooks: Buildkite POSTs build/job state changes to
-//     /webhooks/buildkite, which we translate into retained pipeline status.
+//  1. Identity: knot2 fetches Tack's did:web document from /.well-known/did.json to find the
+//     endpoint it delivers pushes to, and /xrpc/org.tangled.spindle.describeSpindle reports the
+//     same DID with Tack's version and capabilities. The legacy appview instead confirms that the
+//     operator owns this instance by calling /xrpc/sh.tangled.owner during spindle registration.
+//  2. Triggers: knot2 POSTs pushes, and users POST manual runs, to
+//     /xrpc/org.tangled.event.notifyEvent. Both carry service auth (a signed JWT that proves
+//     which atproto account or service is calling).
+//  3. CI XRPC: the Tangled web app calls /xrpc/org.tangled.ci.* straight from the browser to
+//     query pipelines, subscribe to CBOR-framed logs, and retry or approve runs. That is why
+//     /xrpc responses to allowed origins carry CORS headers. The legacy appview calls the older
+//     /xrpc/sh.tangled.ci.* routes from its server.
+//  4. Webhooks: Buildkite POSTs build and job state changes to /webhooks/buildkite, which Tack
+//     translates into retained pipeline status.
 
 import (
 	"context"
@@ -21,17 +28,23 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/bluesky-social/indigo/atproto/atcrypto"
+	"github.com/bluesky-social/indigo/atproto/identity"
 	"tangled.org/core/api/tangled"
 
 	"go.mitchellh.com/tack/internal/buildkite"
+	"go.mitchellh.com/tack/internal/orgtangled"
 )
 
-// runHTTP starts the spindle's HTTP server and blocks until ctx is
-// cancelled or the listener returns a fatal error. On ctx cancellation it
-// performs a graceful shutdown with a bounded timeout.
+// runHTTP starts the spindle's HTTP server and blocks until ctx is cancelled or the listener
+// returns a fatal error. On cancellation it shuts down gracefully, giving in-flight requests up
+// to 10 seconds to finish.
 //
-// bkProvider may be nil. In that case /webhooks/buildkite responds 503 so a
-// misdirected webhook gets a clear failure rather than a misleading 200.
+// bkProvider may be nil. In that case /webhooks/buildkite responds 503, so a misdirected webhook
+// gets a clear failure rather than a misleading 200.
+//
+// The optional spindle key (config.KeyPath) is loaded before the listener opens, so a missing or
+// malformed key file fails startup instead of serving a DID document without it.
 func runHTTP(
 	ctx context.Context,
 	cfg config,
@@ -42,15 +55,17 @@ func runHTTP(
 ) error {
 	logger := loggerFrom(ctx)
 
-	mux := http.NewServeMux()
-	mux.HandleFunc("GET /", rootHandler())
-	mux.HandleFunc("GET /xrpc/"+tangled.OwnerNSID, ownerHandler(logger, cfg.OwnerDID))
-	mux.HandleFunc("POST /webhooks/buildkite", buildkiteWebhookHandler(logger, bkProvider))
-	registerCiRoutes(mux, cfg, logger, st, provider, pipelines)
-
+	key, err := loadSpindleKey(cfg.KeyPath)
+	if err != nil {
+		return err
+	}
+	handler := newHTTPHandler(
+		logger, cfg, st, provider, bkProvider, pipelines,
+		identity.DefaultDirectory(), key,
+	)
 	srv := &http.Server{
 		Addr:              cfg.Addr,
-		Handler:           mux,
+		Handler:           handler,
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 
@@ -72,6 +87,40 @@ func runHTTP(
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	return srv.Shutdown(shutdownCtx)
+}
+
+// newHTTPHandler builds the complete route table. It is separate from runHTTP so tests can
+// drive the real routes through httptest without opening a listener.
+//
+// dir resolves the DID documents of service-auth issuers. Production passes indigo's default
+// network directory. Tests pass a mock directory holding fixed identities, so they verify real
+// signatures without network access. key is the optional public key published in the DID
+// document and may be nil.
+//
+// The CORS middleware wraps the whole mux rather than individual routes. The method-qualified
+// patterns below would otherwise answer every browser OPTIONS preflight with 405 before a
+// per-route wrapper could run. The middleware leaves paths outside /xrpc/ untouched.
+func newHTTPHandler(
+	logger *slog.Logger,
+	cfg config,
+	st *store,
+	provider Provider,
+	bkProvider *buildkiteProvider,
+	pipelines *pipelineService,
+	dir identity.Directory,
+	key atcrypto.PublicKey,
+) http.Handler {
+	cors := newCORSPolicy(cfg.CORSOrigins)
+	auth := newServiceAuth(logger, dir, cfg.DID().String())
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /", rootHandler())
+	mux.HandleFunc("GET "+didDocumentPath, didDocumentHandler(logger, cfg, key))
+	mux.HandleFunc("GET /xrpc/"+tangled.OwnerNSID, ownerHandler(logger, cfg.OwnerDID))
+	mux.HandleFunc("GET /xrpc/"+orgtangled.NSIDDescribeSpindle, describeSpindleHandler(cfg))
+	mux.HandleFunc("POST /webhooks/buildkite", buildkiteWebhookHandler(logger, bkProvider))
+	registerCIRoutes(mux, logger, st, provider, pipelines, auth, cors)
+	return cors.Middleware(mux)
 }
 
 // rootHandler responds at "/" with a friendly identifier page. Mainly

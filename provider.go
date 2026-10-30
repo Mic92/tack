@@ -13,15 +13,14 @@ import (
 	"tangled.org/core/api/tangled"
 )
 
-// LogLine is the on-the-wire shape of a single log frame emitted by a
-// Provider. It mirrors tangled.org/core/spindle/models.LogLine on the
-// JSON level without importing the upstream package — that package
-// transitively pulls in git, vault, redis and a few hundred other
-// modules just to expose a handful of types we don't otherwise need.
+// LogLine is one log frame produced by a Provider: a line of step output or a step start or end
+// marker. It mirrors tangled.org/core/spindle/models.LogLine field for field without importing
+// that package, which pulls in git, vault, redis, and hundreds of other modules for a few types.
 //
-// The JSON tags here MUST stay byte-compatible with the upstream
-// struct: the appview's log proxy decodes against the upstream type,
-// so any tag drift breaks the appview's renderer.
+// Tack never sends LogLine as JSON. The XRPC log subscription converts each one into an
+// sh.tangled or org.tangled subscribePipelineLogs event (see ciLogEvent and orgLogEvent). The
+// JSON tags match upstream so the struct stays a faithful copy that is easy to compare against
+// when Tangled adds fields.
 type LogLine struct {
 	Kind        string    `json:"kind"`
 	Content     string    `json:"content"`
@@ -31,16 +30,28 @@ type LogLine struct {
 	StepStatus  string    `json:"step_status,omitempty"`
 	StepKind    string    `json:"step_kind,omitempty"`
 	StepCommand string    `json:"step_command,omitempty"`
+	// StepOutcome is how a step ended: StepOutcomeSuccess or StepOutcomeFailed. Providers set it
+	// only on StepStatusEnd lines. Tack forwards it only on end frames of the current (Tangled
+	// v1.20) log stream, because the sh.tangled type in the pinned Tangled v1.16 module has no
+	// field for it. Leave it empty when the provider cannot tell, such as for a Buildkite job that
+	// was skipped. The Tangled web app uses it to mark the failed step. If no step in a failed
+	// workflow has an outcome, the app blames the last step.
+	StepOutcome string `json:"step_outcome,omitempty"`
 }
 
-// LogKind / StepStatus enum values, matching the upstream constants
-// (LogKindData, LogKindControl, StepStatusStart, StepStatusEnd) on
-// the wire. Use these instead of bare strings so we don't drift.
+// These are the wire values for LogLine.Kind, LogLine.StepStatus, and LogLine.StepOutcome.
+// They match the constants of the same names in tangled.org/core/spindle/models. Use them
+// instead of bare strings so the values cannot drift from upstream.
 const (
 	LogKindData     = "data"
 	LogKindControl  = "control"
 	StepStatusStart = "start"
 	StepStatusEnd   = "end"
+
+	// The step outcomes are the enum values of the outcome field in the
+	// org.tangled.ci.subscribePipelineLogs lexicon.
+	StepOutcomeSuccess = "success"
+	StepOutcomeFailed  = "failed"
 )
 
 // ErrLogsNotFound is returned by Provider.Logs when the requested
@@ -99,8 +110,9 @@ type Provider interface {
 	// identified by the same (knot, pipelineRkey, workflow) tuple
 	// Spawn was invoked with.
 	//
-	// Each LogLine is translated to one sh.tangled.ci.subscribePipelineLogs
-	// control or data event by the XRPC subscription handler.
+	// The XRPC log subscription turns each LogLine into one control or data event of either
+	// sh.tangled.ci.subscribePipelineLogs (legacy) or org.tangled.ci.subscribePipelineLogs
+	// (current), depending on which method the client called.
 	//
 	// The returned channel is closed by the provider when the stream
 	// is complete; a closed channel is the only "end of stream"

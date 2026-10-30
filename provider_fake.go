@@ -213,15 +213,18 @@ func (p *fakeProvider) runWorkflow(ctx context.Context, knot, pipelineRkey, work
 		}
 	}
 
-	// End control + terminal status publish. "success" matches the
-	// upstream StatusKind enum (see tangled.org/core/spindle/models)
-	// — the appview routes status strings through that same enum.
+	// End control marker and terminal status. The marker reports StepOutcomeSuccess because the
+	// fake's single step always passes. Current (org.tangled.*) log subscribers such as the
+	// Tangled web app read the outcome to decide which step failed, and legacy subscribers never
+	// see it. The "success" status string matches the upstream StatusKind enum (see
+	// tangled.org/core/spindle/models), the enum Tangled checks status strings against.
 	p.appendLogLine(knot, pipelineRkey, workflow, LogLine{
-		Kind:       LogKindControl,
-		Time:       time.Now(),
-		Content:    workflow,
-		StepId:     0,
-		StepStatus: StepStatusEnd,
+		Kind:        LogKindControl,
+		Time:        time.Now(),
+		Content:     workflow,
+		StepId:      0,
+		StepStatus:  StepStatusEnd,
+		StepOutcome: StepOutcomeSuccess,
 	})
 	if err := p.publishStatus(ctx, pipelineURI, workflow, "success", seq); err != nil {
 		logger.Error("publish fake success status", "err", err, "seq", seq)

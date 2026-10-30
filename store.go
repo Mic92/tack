@@ -228,9 +228,11 @@ func (s *store) GetRepo(ctx context.Context, did, rkey string) (knot, spindle st
 	return knot, spindle, nil
 }
 
-// RepoRef is the repository identity Tack needs when turning a knot event into
-// a spindle-owned pipeline. RepoDID is the stable git identity; OwnerDID and
-// Rkey identify the sh.tangled.repo record that assigned the spindle.
+// RepoRef is the repository identity Tack needs when turning a knot event into a spindle-owned
+// pipeline. RepoDID is the stable git identity. For a Go knot repository, OwnerDID and Rkey
+// identify the owner's sh.tangled.repo record that assigned the spindle. For a knot2 repository
+// (see FromManifest), they come from the repo manifest, and Rkey is the key of the owner's
+// org.tangled.repo.declaration record.
 type RepoRef struct {
 	OwnerDID string
 	Rkey     string
@@ -238,6 +240,13 @@ type RepoRef struct {
 	Name     string
 	Spindle  string
 	RepoDID  string
+	// FromManifest reports that this identity was read from a knot2 repo manifest rather than from
+	// a Go knot's describeRepo answer or a mirrored sh.tangled.repo record. When set, Spindle holds
+	// the spindle DID the manifest names instead of a legacy spindle hostname, and OwnerDID and Name
+	// are asserted by the knot alone. The field stays set after pipelineService.ownerDeclaresRepo
+	// confirms the owner, either from a mirrored sh.tangled.repo record or from the owner's PDS. The
+	// store never persists this field, so every RepoRef it returns has it false.
+	FromManifest bool
 }
 
 // RepoByDID resolves the latest repository record for a stable repository DID.
@@ -300,6 +309,25 @@ func (s *store) ManagedRepoByDID(
 		return nil, fmt.Errorf("lookup managed repo by DID: %w", err)
 	}
 	return &repo, nil
+}
+
+// OwnerClaimsRepo reports whether the mirrored repos table holds a sh.tangled.repo record
+// published by ownerDID whose repository DID is repoDID. Rows mirrored from Jetstream (a service
+// that re-serves the atproto firehose as JSON) are keyed by the DID that published them, so a
+// match is first-party proof that ownerDID claims the repository, which a knot cannot forge.
+// ownerDeclaresRepo uses it as a local shortcut before fetching org.tangled.repo.declaration from
+// the owner's PDS. False only means no such record was mirrored, not that the owner disowns the
+// repository.
+func (s *store) OwnerClaimsRepo(ctx context.Context, ownerDID, repoDID string) (bool, error) {
+	var n int
+	err := s.db.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM repos WHERE did = ? AND repo_did = ?`,
+		ownerDID, repoDID,
+	).Scan(&n)
+	if err != nil {
+		return false, fmt.Errorf("check owner repo claim: %w", err)
+	}
+	return n > 0, nil
 }
 
 // HasManagedRepo is the cheap, local half of repository authorization. Trigger

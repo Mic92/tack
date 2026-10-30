@@ -1,6 +1,7 @@
 package main
 
-// Spindle-owned pipeline queries used by the sh.tangled.ci XRPC surface.
+// Pipeline queries over the events table: the legacy sh.tangled.ci reads, plus the lookups that
+// push deduplication and the current org.tangled.ci reads depend on.
 
 import (
 	"context"
@@ -178,6 +179,60 @@ func (s *store) HasPullPipeline(ctx context.Context, pullURI, sourceSHA string) 
 		return false, fmt.Errorf("check pull pipeline: %w", err)
 	}
 	return count > 0, nil
+}
+
+// PipelineForPush returns the record key of the newest pipeline already created for the push of
+// ref from oldSHA to newSHA in repoDID, or "" when there is none. It is the durable half of push
+// deduplication (the in-memory half is pipelineService.coalescePush). knot2 retries any delivery it
+// does not count as answered (see the notify.go file comment), signing every attempt with a fresh
+// service auth token. The same push can therefore arrive more than once,
+// and neither the request nor its token identifies it. The push is identified by its content
+// instead: repository, ref, old SHA, and new SHA.
+func (s *store) PipelineForPush(ctx context.Context, repoDID, ref, oldSHA, newSHA string) (string, error) {
+	var rkey string
+	err := s.db.QueryRowContext(ctx, `
+		SELECT rkey
+		FROM events
+		WHERE nsid = ?
+		  AND json_extract(event_json, '$.triggerMetadata.kind') = 'push'
+		  AND json_extract(event_json, '$.triggerMetadata.repo.repoDid') = ?
+		  AND json_extract(event_json, '$.triggerMetadata.push.ref') = ?
+		  AND json_extract(event_json, '$.triggerMetadata.push.oldSha') = ?
+		  AND json_extract(event_json, '$.triggerMetadata.push.newSha') = ?
+		ORDER BY created DESC
+		LIMIT 1`,
+		tangled.PipelineNSID, repoDID, ref, oldSHA, newSHA,
+	).Scan(&rkey)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", nil
+	}
+	if err != nil {
+		return "", fmt.Errorf("check push pipeline: %w", err)
+	}
+	return rkey, nil
+}
+
+// HasRepoPipelines reports whether any stored pipeline belongs to repoDID. It matches repositories
+// the same way QueryPipelines and QueryOrgPipelines do: by the trigger's repo.repoDid field, or by
+// repo.did for records written before stable repository DIDs. Retained pipeline history shows
+// Tack has served the repository, which is enough for isRepoIndexed to answer without its later
+// checks, the last of which is a network lookup of the repo manifest on the repository's knot.
+func (s *store) HasRepoPipelines(ctx context.Context, repoDID string) (bool, error) {
+	var exists int
+	err := s.db.QueryRowContext(ctx, `
+		SELECT EXISTS (
+			SELECT 1 FROM events
+			WHERE nsid = ?
+			  AND COALESCE(
+				json_extract(event_json, '$.triggerMetadata.repo.repoDid'),
+				json_extract(event_json, '$.triggerMetadata.repo.did')
+			  ) = ?
+		)`, tangled.PipelineNSID, repoDID,
+	).Scan(&exists)
+	if err != nil {
+		return false, fmt.Errorf("check repo pipelines: %w", err)
+	}
+	return exists == 1, nil
 }
 
 // sqlPlaceholders returns a comma-separated placeholder list for a non-empty

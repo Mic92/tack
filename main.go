@@ -10,16 +10,19 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 
+	"github.com/bluesky-social/indigo/atproto/syntax"
 	charmlog "github.com/charmbracelet/log"
+	"tangled.org/core/xrpc/serviceauth"
 
 	"go.mitchellh.com/tack/internal/buildkite"
 )
 
-// config is the runtime configuration, sourced from environment variables and
-// flags. Env vars match the README so this can be swapped in for the stock
-// spindle without surprises.
+// config is the runtime configuration, read from TACK_* environment variables and command-line
+// flags. The README documents each variable. The names differ from the upstream spindle's
+// SPINDLE_SERVER_* variables, so an upstream spindle's environment does not carry over unchanged.
 type config struct {
 	Addr         string
 	Hostname     string
@@ -29,9 +32,23 @@ type config struct {
 	// RepoDir holds sparse, mutable workflow checkouts. It is separate from
 	// provider workspaces: Tack reads configuration here but never executes it.
 	RepoDir string
-	// Dev flips the knot event-stream scheme from wss:// to ws://.
-	// Useful when running against a local knot during development.
+	// Dev is for local infrastructure. It switches knot event streams to ws://, allows plain http
+	// for knot, PDS, and blob requests, and lets the outbound HTTP client dial loopback and private
+	// addresses. Never set it in production.
 	Dev bool
+
+	// CORSOrigins lists the browser origins allowed to call /xrpc (CORS is the browser rule that
+	// hides a response from a page on another origin unless the server opts in). The Tangled web
+	// app calls spindles directly from the browser, so the default is https://tangled.org. "*"
+	// allows any origin, and an empty list disables CORS.
+	CORSOrigins []string
+	// KeyPath optionally names a P-256 PEM private key whose public half is published in the
+	// did:web document. Tack signs nothing with it. It exists so operators can serve a document
+	// that matches the upstream spindle's. Empty means the document has no verification method.
+	KeyPath string
+	// ContactEmail is the operator contact reported by org.tangled.spindle.describeSpindle. Empty
+	// omits the contact from the response.
+	ContactEmail string
 
 	// Buildkite-mode configuration. BuildkiteToken is the switch:
 	// when empty we fall back to the in-process fake provider
@@ -75,6 +92,9 @@ func loadConfig() (config, error) {
 		DBPath:                 dbPath,
 		RepoDir:                envOr("TACK_REPO_DIR", dbPath+".repos"),
 		Dev:                    os.Getenv("TACK_DEV") != "",
+		CORSOrigins:            corsOriginsFromEnv(),
+		KeyPath:                os.Getenv("TACK_KEY_PATH"),
+		ContactEmail:           os.Getenv("TACK_CONTACT_EMAIL"),
 		BuildkiteToken:         os.Getenv("TACK_BUILDKITE_TOKEN"),
 		BuildkiteOrg:           os.Getenv("TACK_BUILDKITE_ORG"),
 		BuildkiteWebhookSecret: os.Getenv("TACK_BUILDKITE_WEBHOOK_SECRET"),
@@ -94,11 +114,9 @@ func loadConfig() (config, error) {
 		return cfg, errors.New("TACK_OWNER_DID is required")
 	}
 
-	// Hostname identifies *us* in sh.tangled.repo records (the .spindle
-	// field). Without it we have no way to know which repos point at us
-	// and therefore which knots we should subscribe to for pipeline
-	// triggers — so we refuse to start rather than silently subscribe to
-	// nothing.
+	// Hostname identifies Tack. Legacy sh.tangled.repo records name it in their spindle field,
+	// and current repo manifests name the did:web derived from it (see config.DID). Without it no
+	// repository can select Tack, so refuse to start rather than silently serve nothing.
 	if cfg.Hostname == "" {
 		return cfg, errors.New("TACK_HOSTNAME is required")
 	}
@@ -128,6 +146,31 @@ func loadConfig() (config, error) {
 	}
 
 	return cfg, nil
+}
+
+// DID returns Tack's service identity, did:web:<Hostname>. A repo manifest selects Tack only when
+// its spindle field equals this string exactly, and service auth tokens must name it as their
+// audience. It is also the DID published in the did:web document and by describeSpindle.
+func (c config) DID() syntax.DID {
+	return serviceauth.DidWeb(c.Hostname)
+}
+
+// corsOriginsFromEnv parses TACK_CORS_ORIGINS as a comma-separated list of origins, dropping
+// blank entries. An unset variable means the Tangled web app at https://tangled.org. A variable
+// that is set but empty yields no origins, which disables CORS, so operators who do not want
+// browser access can turn it off without naming a placeholder origin.
+func corsOriginsFromEnv() []string {
+	raw, ok := os.LookupEnv("TACK_CORS_ORIGINS")
+	if !ok {
+		return []string{"https://tangled.org"}
+	}
+	var origins []string
+	for origin := range strings.SplitSeq(raw, ",") {
+		if origin = strings.TrimSpace(origin); origin != "" {
+			origins = append(origins, origin)
+		}
+	}
+	return origins
 }
 
 func envOr(key, def string) string {

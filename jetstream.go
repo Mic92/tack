@@ -14,8 +14,10 @@ package main
 //   - sh.tangled.repo.collaborator    — collaborators on those repos
 //   - sh.tangled.repo.pull            — branch-based pull request triggers
 //
-// (CI triggers do not come over jetstream. Knots publish git.refUpdate on
-// their event streams; Tack turns those into spindle-owned pipelines.)
+// Push triggers do not come over Jetstream. A Go knot publishes sh.tangled.git.refUpdate on its
+// event stream (see knot.go), and knot2 calls Tack's notifyEvent procedure directly (see
+// notify.go). Jetstream also never sees knot2 repository assignments, which live in the repo
+// manifest that servedRepo reads from the knot.
 
 import (
 	"context"
@@ -102,13 +104,23 @@ func applyCommit(
 	c := evt.Commit
 	switch c.Collection {
 	case tangled.SpindleMemberNSID:
-		return applySpindleMember(ctx, st, knots, hostname, ownerDID, evt.Did, c)
+		err := applySpindleMember(ctx, st, knots, hostname, ownerDID, evt.Did, c)
+		if err == nil && pipelines != nil {
+			// Both admission paths require the repository owner to be the spindle owner or a
+			// member: admitManifestRepo for knot2 and ManagedRepoByDID for the Go knot. The
+			// served-repo cache holds negative answers too, so without this flush a new member
+			// would stay refused (and a removed one admitted) until the entry expired.
+			pipelines.invalidateRepoCaches()
+		}
+		return err
 	case tangled.RepoNSID:
 		err := applyRepo(ctx, st, knots, hostname, ownerDID, evt.Did, c)
 		if err == nil && pipelines != nil {
-			// A repo update can change knot, owner, rkey, or spindle assignment.
-			// Canonical verification cache entries must not outlive that mutation.
-			pipelines.invalidateRepoVerificationCache()
+			// A legacy sh.tangled.repo record can change a repository's knot, owner, record
+			// key, or spindle assignment. It is also the first-party ownership proof that
+			// ownerDeclaresRepo checks before admitting a knot2 repository. Neither the
+			// verified-identity cache nor the served-repo cache may outlive that change.
+			pipelines.invalidateRepoCaches()
 		}
 		return err
 	case tangled.RepoCollaboratorNSID:
@@ -372,10 +384,11 @@ func reconcileMember(
 	return nil
 }
 
-// applyRepoCollaborator mirrors legacy PDS collaborator records. Current knots
-// also emit authoritative collaboratorUpdate events; both shapes share one
-// table, and authorization requires the collaborator publisher to match the
-// canonical repo owner before either can grant trigger access.
+// applyRepoCollaborator mirrors legacy sh.tangled.repo.collaborator records from the owner's PDS.
+// A Go knot also emits authoritative sh.tangled.repo.collaboratorUpdate events (see knot.go).
+// Both sources write the same table, and a row grants trigger access only when its publisher is
+// the canonical repository owner. knot2 collaborators are never mirrored. They are read live from
+// the knot (see pipelineService.listCollaborators).
 func applyRepoCollaborator(ctx context.Context, st *store, did string, c *jsmodels.Commit) error {
 	switch c.Operation {
 	case jsOpCreate, jsOpUpdate:
