@@ -67,6 +67,7 @@ Tack supports both:
 | `TACK_BUILDKITE_ORG`            | Default Buildkite organization slug (workflows may override via YAML)          |
 | `TACK_BUILDKITE_WEBHOOK_SECRET` | Shared secret for `/webhooks/buildkite` auth                                   |
 | `TACK_BUILDKITE_WEBHOOK_MODE`   | `token` (default) or `signature` — must match the notification service        |
+| `TACK_BUILDKITE_API_URL`        | Buildkite REST API root (default `https://api.buildkite.com`)                  |
 
 The pipeline a workflow runs against is **not** an environment
 variable. It lives inside the workflow YAML so each repo can target

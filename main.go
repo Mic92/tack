@@ -61,6 +61,7 @@ type config struct {
 	// against is no longer global — it's pulled from the workflow
 	// body itself (see workflowConfig in provider_buildkite.go).
 	BuildkiteToken         string
+	BuildkiteAPIURL        string
 	BuildkiteOrg           string
 	BuildkiteWebhookSecret string
 	BuildkiteWebhookMode   buildkite.WebhookMode
@@ -96,6 +97,7 @@ func loadConfig() (config, error) {
 		KeyPath:                os.Getenv("TACK_KEY_PATH"),
 		ContactEmail:           os.Getenv("TACK_CONTACT_EMAIL"),
 		BuildkiteToken:         os.Getenv("TACK_BUILDKITE_TOKEN"),
+		BuildkiteAPIURL:        strings.TrimRight(envOr("TACK_BUILDKITE_API_URL", buildkite.APIBase), "/"),
 		BuildkiteOrg:           os.Getenv("TACK_BUILDKITE_ORG"),
 		BuildkiteWebhookSecret: os.Getenv("TACK_BUILDKITE_WEBHOOK_SECRET"),
 		BuildkiteWebhookMode: buildkite.WebhookMode(
@@ -244,6 +246,7 @@ func main() {
 
 	var bkProvider *buildkiteProvider
 	if cfg.BuildkiteToken != "" {
+		buildkite.APIBase = cfg.BuildkiteAPIURL
 		bkProvider = newBuildkiteProvider(
 			br, st,
 			buildkite.NewClient(cfg.BuildkiteToken),

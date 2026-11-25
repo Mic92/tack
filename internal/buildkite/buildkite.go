@@ -29,9 +29,8 @@ import (
 	"time"
 )
 
-// APIBase is the public Buildkite REST API root. Exported as a var
-// (not a const) so tests can swap it for an httptest server URL
-// without hooking up a real Buildkite account.
+// APIBase is the Buildkite REST API root. Exported as a var (not a
+// const) so TACK_BUILDKITE_API_URL and tests can point it elsewhere.
 var APIBase = "https://api.buildkite.com"
 
 // ErrNotFound is returned by Get* methods when the upstream returns
